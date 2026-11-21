@@ -1,0 +1,2 @@
+# 本插件仅使用 AstrBot 自带依赖：aiosqlite（已在 AstrBot 4.x 主依赖中）
+# 无需额外安装第三方库。

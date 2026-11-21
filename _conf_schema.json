@@ -1,0 +1,105 @@
+{
+  "default_rest_mode": {
+    "description": "新用户默认的月休方案",
+    "type": "int",
+    "default": 4,
+    "options": [4, 6, 8],
+    "hint": "4 = 月休 4 天，6 = 月休 6 天，8 = 双休。用户可在指令或 WebUI 中随时切换。"
+  },
+  "default_shift_start": {
+    "description": "默认上班时间",
+    "type": "string",
+    "default": "09:00",
+    "hint": "24 小时制，例如 09:00、08:30、22:00（支持跨天夜班）"
+  },
+  "default_shift_end": {
+    "description": "默认下班时间",
+    "type": "string",
+    "default": "18:00",
+    "hint": "早于上班时间会被视为跨天班次，例如 22:00-06:00"
+  },
+  "default_break_minutes": {
+    "description": "每班扣除的休息分钟",
+    "type": "int",
+    "default": 60,
+    "hint": "计算计划工时和打卡工时时都会扣掉这段饭休/休息时间"
+  },
+  "default_hourly_rate": {
+    "description": "默认时薪（元/小时）",
+    "type": "float",
+    "default": 0,
+    "hint": "新用户默认时薪，用户可用「/工薪 设置 22.5」修改"
+  },
+  "default_overtime_rate": {
+    "description": "默认加班倍率",
+    "type": "float",
+    "default": 1.5,
+    "hint": "超出当天计划工时的部分按此倍率计薪"
+  },
+  "prefer_weekend": {
+    "description": "排休时优先落在周末",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后休息日会尽量贴近周六/周日，关闭则严格按均匀间隔排休"
+  },
+  "absence_deduction": {
+    "description": "缺勤是否扣款",
+    "type": "bool",
+    "default": false,
+    "hint": "默认只统计缺勤天数不扣钱，避免漏打卡导致工资变成负数；需要严格核算时再打开"
+  },
+  "rest_day_as_overtime": {
+    "description": "休息日打卡算加班",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，排休日上班的工时全部按加班倍率计算"
+  },
+  "enable_ai_punch": {
+    "description": "允许 AI 帮用户打卡",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭：AI 只能查排班、工时、工资。开启后 AI 可在用户明确要求时写入上班/下班打卡。"
+  },
+  "enable_ai_bulk_punch": {
+    "description": "允许 AI 批量补录打卡",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，用户说「把11月1号到20号都补成8点到20点，5号14号休息」时，AI 会一次性补齐这段日期；只补用户明确给出的日期范围，最多 62 天。"
+  },
+  "enable_ai_plan": {
+    "description": "允许 AI 改排班（休息日 / 班次时长）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，用户口头说「月休4天，5、14、18、25休息」「每天12小时，8点到20点」时，AI 会直接写入班表并重排。"
+  },
+  "enable_ai_pay": {
+    "description": "允许 AI 设置月薪 / 时薪",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，用户说「我月薪5000」「时薪18」时，AI 会写入工资口径并按月薪或时薪重算；没说具体数字不会乱写。"
+  },
+  "enable_ai_fine": {
+    "description": "允许 AI 记罚款",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，用户说「这个月被罚了200」时，AI 会记账并从当月实发工资里扣掉；金额要用户明确说出。"
+  },
+  "remind_enabled": {
+    "description": "开启上下班提醒",
+    "type": "bool",
+    "default": true,
+    "hint": "只对排班表里当天为「工作日」的人推送；用户可发「/提醒 关」单独关闭"
+  },
+  "remind_before_start_minutes": {
+    "description": "上班提前多少分钟提醒",
+    "type": "int",
+    "default": 30,
+    "hint": "0 ~ 240；填 0 表示不发上班提醒。新用户默认用这个值。"
+  },
+  "remind_before_end_minutes": {
+    "description": "下班提前多少分钟提醒",
+    "type": "int",
+    "default": 15,
+    "hint": "0 ~ 240；填 0 表示不发下班提醒。夜班的下班提醒会在班次结束当天准点触发。"
+  }
+}
