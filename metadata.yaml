@@ -2,7 +2,12 @@ name: astrbot_plugin_shift_board
 display_name: 排班工坊 · 工时与工薪
 short_desc: 月休 4/6/8 天排班表 + 打卡工时 + 时薪/月薪核算 + 温柔上下班提醒 + 下班入账结算 + 罚款扣款，AI 可口头排班与批量补卡
 desc: 按月休 4/6/8 天自动生成排班表，也可以口头点名「5、14、18、25 号休息」按指定日期排；支持上班/下班打卡、单条补录、AI 批量补一段日期的历史打卡、工时汇总、时薪或月薪核算（支持口头设置月薪/时薪）、罚款扣款、工作日上下班温柔提醒；下班打卡后自动结算「今天入账多少钱」与本月累计实发。注册 9 个 LLM 工具供机器人 AI 直接查询与口头写入排班、月薪/时薪、罚款、批量打卡。每个人按「平台 + 账号」独立存数据，附带液态玻璃风格的 WebUI 排班日历与工时看板，可上传自定义背景，后台支持整库 JSON 备份导出/导入与打卡 CSV 批量导入。
-author: 豆包
+author: DwuHu
+repo: https://github.com/DwuHu/astrbot_plugin_shift_board
+social_link: https://github.com/DwuHu
+tags:
+  - 效率
+  - 生活实用
 version: 1.8.0
 support_platforms:
   - aiocqhttp

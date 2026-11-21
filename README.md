@@ -1,8 +1,13 @@
-# 排班工坊 · 工时与工薪（astrbot_plugin_shift_board）
+# 排班工坊 · 工时与工薪
 
-给 AstrBot 用的排班 + 工时 + 工薪插件：月休 **4 / 6 / 8 天**随时切换，班表按人独立生成，
-配合上下班打卡统计实际工时，再按时薪算出正常工资、加班费和缺勤扣款。
-附带一个 WebUI 页面（排班日历 + 工时看板），玻璃质感、暗色/亮色都适配。
+**`astrbot_plugin_shift_board`** · 给 AstrBot 的排班 / 考勤 / 工时 / 工薪插件
+
+作者：[DwuHu（九月月）](https://github.com/DwuHu) · 仓库：[github.com/DwuHu/astrbot_plugin_shift_board](https://github.com/DwuHu/astrbot_plugin_shift_board) · 当前版本：**v1.8.0**
+
+> 月休 4 / 6 / 8 天自动排班，上下班打卡算工时，时薪或月薪自动核算；AI 一句话就能排班、补一段日期的打卡、设置工资。附带液态玻璃风格的 WebUI 排班日历与工时看板。
+
+班表按人独立生成，打卡自动算实际工时，正常工资、加班费、缺勤扣款、罚款一起结算；
+WebUI 支持日历补录、整库 JSON 备份和打卡 CSV 批量导入，暗色 / 亮色都适配。
 
 ## 功能一览
 
@@ -19,6 +24,12 @@
 
 ## 安装
 
+### 方式一：插件市场（上架后）
+
+AstrBot WebUI → 插件 → 插件市场 → 搜索「排班工坊」或 `astrbot_plugin_shift_board` → 安装 → 启用。
+
+### 方式二：手动安装
+
 1. 把整个 `astrbot_plugin_shift_board` 目录放进：
 
    ```text
@@ -28,10 +39,28 @@
 2. 打开 AstrBot WebUI → 插件管理 → 找到「排班工坊 · 工时与工薪」→ 启用 / 重载插件。
 3. 在 QQ 里发送 `/排班 帮助` 查看全部指令。
 4. WebUI 里点插件卡片，进入「排班日历 · 工时看板」页面即可打开看板（右侧还有提醒设置）。
-5. 如果想让别的人也用：把目录或 zip 发给他们，各自装在自己的 AstrBot 里即可。
-   每套部署用一个独立的 `shift_board.db`，彼此的排班、打卡、工资完全分开。
 
 > 依赖：只用 AstrBot 自带的 `aiosqlite`，无需额外 pip 安装。
+
+### 装好后先做这三步
+
+```text
+/工薪 时薪 18          # 或 /工薪 月薪 5000
+/排班 月休 4           # 设置月休方案
+/打卡 上班             # 上班打卡，下班发 /打卡 下班
+```
+
+如果班次是固定的，例如每天 `08:00-20:00`、午休 1 小时不算钱，直接说：
+
+```text
+每天 8 点到 20 点，月休 4 天，5、14、18、25 号休息
+```
+
+AI 会按这段口头描述重排整月班表；历史打卡也可以一句话批量补：
+
+```text
+把 11 月 1 号到 20 号每天 8 点到 20 点补上，5 号和 14 号休息
+```
 
 ## 指令
 
@@ -259,3 +288,11 @@ venv\Scripts\python.exe ..\..\data\plugins\astrbot_plugin_shift_board\tests\smok
 指定休息日覆盖自动排休、白夜班自动识别、罚款从实发扣除；
 提醒的按时触发 / 不重复 / 休息日静默 / 已打卡不催、两个用户数据互不串、AI 工具返回内容与打卡拦截；
 冒烟自检另外验证整库备份往返导入、打卡 CSV 解析、SQLite 落库读回、月历渲染、11 条 Web API 路由（含背景读取/保存、备份导出/导入、打卡 CSV 导入）与页面静态资源。
+
+## 关于
+
+- 作者：DwuHu（九月月）
+- 仓库：[https://github.com/DwuHu/astrbot_plugin_shift_board](https://github.com/DwuHu/astrbot_plugin_shift_board)
+- 问题反馈 / 功能建议：[提交 Issue](https://github.com/DwuHu/astrbot_plugin_shift_board/issues)
+- 许可证：[Apache-2.0](https://github.com/DwuHu/astrbot_plugin_shift_board/blob/main/LICENSE)
+- 数据只存在你部署的 AstrBot 本地 `data/plugin_data/astrbot_plugin_shift_board/shift_board.db`，不会上传到任何服务器。
