@@ -34,7 +34,19 @@
     "description": "默认加班倍率",
     "type": "float",
     "default": 1.5,
-    "hint": "超出当天计划工时的部分按此倍率计薪"
+    "hint": "超过每日标准工时后，加班部分按此倍率计薪"
+  },
+  "default_standard_hours": {
+    "description": "默认每日标准工时",
+    "type": "float",
+    "default": 8.0,
+    "hint": "超过这个小时数就算加班，默认 8 小时；用户可用 /提醒 加班 8 或 /工薪 加班 1.5 8 修改"
+  },
+  "overtime_alert_enabled": {
+    "description": "开启加班提醒（总开关）",
+    "type": "bool",
+    "default": true,
+    "hint": "员工上班超过每日标准工时时推送一次加班提醒；员工还可以用 /提醒 加班 关 单独关闭"
   },
   "prefer_weekend": {
     "description": "排休时优先落在周末",
@@ -60,6 +72,18 @@
     "default": false,
     "hint": "默认关闭：AI 只能查排班、工时、工资。开启后 AI 可在用户明确要求时写入上班/下班打卡。"
   },
+  "enable_ai_punch_delete": {
+    "description": "允许 AI 删除某天打卡",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭，删除不可恢复。开启后，用户明确说「删掉11月20号打卡」时 AI 才会清空那一天。"
+  },
+  "enable_ai_remind": {
+    "description": "允许 AI 修改提醒设置",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，用户说「上班提醒改成…」「关掉天气提醒」时，AI 可以改提醒开关、提前分钟、自定义文案和天气城市。"
+  },
   "enable_ai_bulk_punch": {
     "description": "允许 AI 批量补录打卡",
     "type": "bool",
@@ -83,6 +107,30 @@
     "type": "bool",
     "default": true,
     "hint": "开启后，用户说「这个月被罚了200」时，AI 会记账并从当月实发工资里扣掉；金额要用户明确说出。"
+  },
+  "enable_ai_deduction": {
+    "description": "允许 AI 管理每月固定扣款",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，用户说「每月房租1500、水电120、餐费600」时，AI 可以按用户自定义的标签新增/删除扣款，并参与到手工资计算与费用占比图。"
+  },
+  "weather_reminder_enabled": {
+    "description": "开启天气提醒",
+    "type": "bool",
+    "default": true,
+    "hint": "需要先在 AstrBot 开启「联网搜索」并配置搜索服务；用户在 /提醒 城市 里设置城市，AI 会把天气写成一句话放进上下班提醒。"
+  },
+  "default_weather_city": {
+    "description": "默认天气城市",
+    "type": "string",
+    "default": "",
+    "hint": "新用户默认城市，例如 宜宾、成都；留空表示不自动加天气，用户可用 /提醒 城市 设置。"
+  },
+  "weather_cache_minutes": {
+    "description": "天气缓存分钟",
+    "type": "int",
+    "default": 30,
+    "hint": "同一个人同一天同一时段内复用天气结果，避免每条提醒都调用 AI 搜索；建议 20 ~ 120。"
   },
   "remind_enabled": {
     "description": "开启上下班提醒",

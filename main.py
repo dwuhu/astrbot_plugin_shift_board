@@ -17,8 +17,10 @@ import csv
 import io
 import json
 import re
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -77,6 +79,7 @@ def _parse_day_token(token: str) -> date | None:
         token.replace("年", "-")
         .replace("月", "-")
         .replace("日", "")
+        .replace("号", "")
         .replace("/", "-")
         .replace(".", "-")
     )
@@ -93,6 +96,35 @@ def _parse_day_token(token: str) -> date | None:
             return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
         except ValueError:
             return None
+    return None
+
+
+def _parse_date_range(text: str) -> tuple[date, date] | None:
+    """解析「10月1号到10月21号」「2026-10-01 2026-10-21」这类区间。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    parts = [
+        part
+        for part in re.split(r"\s*(?:到|至|~|～|—|－)\s*", raw)
+        if part.strip()
+    ]
+    dates = [_parse_day_token(part) for part in parts]
+    dates = [item for item in dates if item is not None]
+    if len(dates) == 1:
+        return dates[0], dates[0]
+    if len(dates) >= 2:
+        start, end = dates[0], dates[1]
+        return (start, end) if start <= end else (end, start)
+    # 没写「到」时，尝试从长文本里抽出两个日期
+    tokens = re.findall(
+        r"\d{4}-\d{1,2}-\d{1,2}|\d{1,2}\s*[月./-]\s*\d{1,2}\s*[日号]?",
+        raw,
+    )
+    found = [_parse_day_token(token) for token in tokens]
+    found = [item for item in found if item is not None]
+    if len(found) >= 2:
+        return min(found[0], found[1]), max(found[0], found[1])
     return None
 
 
@@ -326,6 +358,7 @@ class ShiftBoardPlugin(Star):
         self.store = ShiftStore(data_dir / "shift_board.db")
         self._register_web_apis()
         self._reminder_task: asyncio.Task | None = None
+        self._weather_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
         self._start_reminder_task()
 
     # ------------------------------------------------------------------ #
@@ -339,6 +372,9 @@ class ShiftBoardPlugin(Star):
             ("regenerate", self.api_regenerate, ["POST"], "重新生成整月排班"),
             ("punch", self.api_punch, ["POST"], "补录打卡"),
             ("punch/delete", self.api_punch_delete, ["POST"], "删除打卡"),
+            ("day-mark", self.api_day_mark, ["POST"], "标记未上班/请假或恢复工作日"),
+            ("deduction/save", self.api_deduction_save, ["POST"], "新增/修改每月扣款"),
+            ("deduction/delete", self.api_deduction_delete, ["POST"], "删除每月扣款"),
             ("background", self.api_background, ["GET"], "读取页面背景设置"),
             ("background/save", self.api_background_save, ["POST"], "保存页面背景设置"),
             ("data/export", self.api_data_export, ["GET"], "导出整库备份 JSON"),
@@ -360,6 +396,7 @@ class ShiftBoardPlugin(Star):
             prefer_weekend=bool(cfg.get("prefer_weekend", True)),
             hourly_rate=float(cfg.get("default_hourly_rate", 0) or 0),
             overtime_rate=float(cfg.get("default_overtime_rate", 1.5) or 1.5),
+            standard_hours=float(cfg.get("default_standard_hours", 8.0) or 8.0),
             absence_deduction=bool(cfg.get("absence_deduction", False)),
             rest_day_as_overtime=bool(cfg.get("rest_day_as_overtime", True)),
         ).normalized()
@@ -372,6 +409,13 @@ class ShiftBoardPlugin(Star):
             "before_end": int(cfg.get("remind_before_end_minutes", 15) or 0),
         }
 
+    def _weather_defaults(self) -> dict:
+        cfg = self.config
+        return {
+            "city": str(cfg.get("default_weather_city", "") or "").strip()[:40],
+            "enabled": bool(cfg.get("weather_reminder_enabled", True)),
+        }
+
     async def _user(self, event: AstrMessageEvent) -> UserRecord:
         uid = str(event.get_sender_id() or "unknown").strip() or "unknown"
         platform = (event.get_platform_name() or "").strip() or "unknown"
@@ -379,6 +423,7 @@ class ShiftBoardPlugin(Star):
         user_key = f"{platform}:{uid}"
         nickname = event.get_sender_name() or uid
         self._start_reminder_task()
+        weather = self._weather_defaults()
         return await self.store.ensure_user(
             user_key,
             uid=uid,
@@ -387,6 +432,8 @@ class ShiftBoardPlugin(Star):
             defaults=self._default_profile(),
             umo=str(getattr(event, "unified_msg_origin", "") or ""),
             remind_defaults=self._reminder_defaults(),
+            weather_city=weather["city"],
+            weather_enabled=weather["enabled"],
         )
 
     async def _ensure_month(
@@ -408,7 +455,12 @@ class ShiftBoardPlugin(Star):
         self, user_key: str, month: str, profile: Profile
     ) -> list[DaySlot]:
         rests = await self.store.get_month_rests(user_key, month)
+        keep_leave = await self.store.get_leave_days(user_key, month)
         slots = build_month_schedule_for(month, profile, rest_override=rests)
+        if keep_leave:
+            for slot in slots:
+                if int(slot.day[-2:]) in keep_leave and slot.kind == "work":
+                    slot.kind = "leave"
         await self.store.save_schedule(user_key, month, slots)
         return slots
 
@@ -428,6 +480,7 @@ class ShiftBoardPlugin(Star):
             today=date.today(),
             month_complete=month < current_month,
             fine_total=await self.store.fine_total(user_key, month),
+            deductions=await self.store.list_deductions(user_key, month),
         )
         return slots, summary
 
@@ -529,16 +582,35 @@ class ShiftBoardPlugin(Star):
             return
         users = await self.store.list_users(limit=1000)
         for user in users:
-            if not user.remind_enabled or not user.umo:
+            if not user.umo:
                 continue
-            if user.remind_before_start <= 0 and user.remind_before_end <= 0:
-                continue
-            try:
-                await self._check_one_reminder(user, now)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    f"排班工坊：{user.user_key} 的提醒检查失败：{exc}"
-                )
+            if user.remind_enabled and (
+                user.remind_before_start > 0 or user.remind_before_end > 0
+            ):
+                try:
+                    await self._check_one_reminder(user, now)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"排班工坊：{user.user_key} 的提醒检查失败：{exc}"
+                    )
+            if (
+                user.remind_enabled
+                and user.overtime_alert_enabled
+                and bool(self.config.get("overtime_alert_enabled", True))
+            ):
+                try:
+                    await self._check_overtime_alert(user, now)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"排班工坊：{user.user_key} 的加班提醒检查失败：{exc}"
+                    )
+            if user.rest_reminder_enabled:
+                try:
+                    await self._check_rest_ahead(user, now)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"排班工坊：{user.user_key} 的休息日提醒检查失败：{exc}"
+                    )
 
     async def _check_one_reminder(self, user: UserRecord, now: datetime) -> None:
         # 夜班的下班时间会落在次日，所以昨天也要看一眼
@@ -564,6 +636,7 @@ class ShiftBoardPlugin(Star):
                     if await self.store.mark_reminded(
                         user.user_key, base.isoformat(), "in"
                     ):
+                        weather = await self._weather_line(user, "in", base, slot)
                         await self._send_text(
                             user.umo,
                             render.remind_text(
@@ -575,6 +648,8 @@ class ShiftBoardPlugin(Star):
                                 minutes=slot.planned_minutes,
                                 before=user.remind_before_start,
                                 punch_state="none",
+                                template=user.remind_in_text,
+                                weather=weather,
                             ),
                         )
 
@@ -586,6 +661,9 @@ class ShiftBoardPlugin(Star):
                         user.user_key, base.isoformat(), "out"
                     ):
                         opened = next((item for item in punches if item.is_open), None)
+                        weather = await self._weather_line(
+                            user, "out", end_dt.date(), slot
+                        )
                         await self._send_text(
                             user.umo,
                             render.remind_text(
@@ -598,8 +676,255 @@ class ShiftBoardPlugin(Star):
                                 before=user.remind_before_end,
                                 punch_state="open" if opened else "none",
                                 open_at=opened.start if opened else "",
+                                template=user.remind_out_text,
+                                weather=weather,
+                                tomorrow_text=(
+                                    await self._rest_ahead_text(
+                                        user.user_key, end_dt.date(), user.profile
+                                    )
+                                    if user.rest_reminder_enabled
+                                    else ""
+                                ),
                             ),
                         )
+
+    async def _rest_ahead_text(
+        self, user_key: str, base: date, profile: Profile
+    ) -> str:
+        """下班提醒里预告接下来的休息日；双休会一次说两天。"""
+        first = base + timedelta(days=1)
+        slots: list[DaySlot] = []
+        for month in sorted({f"{first:%Y-%m}", f"{(first + timedelta(days=6)):%Y-%m}"}):
+            slots.extend(await self._ensure_month(user_key, month, profile))
+        by_day = {slot.day: slot for slot in slots}
+        rest_days: list[date] = []
+        for offset in range(7):
+            current = first + timedelta(days=offset)
+            slot = by_day.get(current.isoformat())
+            if slot is None or slot.kind != "rest":
+                break
+            rest_days.append(current)
+        if not rest_days:
+            return ""
+        if len(rest_days) == 1:
+            target = rest_days[0]
+            return f"🌙 明天（{target.month}月{target.day}日）休息，今晚不用惦记早起，安心收工。"
+        if len(rest_days) == 2:
+            first_day, last_day = rest_days
+            return (
+                f"🌙 明天、后天（{first_day.month}月{first_day.day}日"
+                f"-{last_day.month}月{last_day.day}日）都休息，连休两天，今晚可以好好放松。"
+            )
+        first_day, last_day = rest_days[0], rest_days[-1]
+        return (
+            f"🌙 明天起连休 {len(rest_days)} 天"
+            f"（{first_day.month}月{first_day.day}日-{last_day.month}月{last_day.day}日），"
+            "今晚放心收工。"
+        )
+
+    async def _check_rest_ahead(self, user: UserRecord, now: datetime) -> None:
+        """只按排班表判断：今天上完班、明天休息时，下班后提醒一次。"""
+        for base in (now.date(), now.date() - timedelta(days=1)):
+            slot = await self._slot_for_day(user.user_key, base, user.profile)
+            if slot is None or slot.kind != "work":
+                continue
+            tomorrow = base + timedelta(days=1)
+            next_slot = await self._slot_for_day(
+                user.user_key, tomorrow, user.profile
+            )
+            if next_slot is None or next_slot.kind != "rest":
+                continue
+            start_min = parse_hhmm(slot.start, user.profile.shift_start)
+            end_min = parse_hhmm(slot.end, user.profile.shift_end)
+            day_zero = datetime(base.year, base.month, base.day)
+            end_dt = day_zero + timedelta(minutes=end_min)
+            if end_min <= start_min:
+                end_dt += timedelta(days=1)
+            if not self._in_window(now, end_dt):
+                continue
+            line = await self._rest_ahead_text(user.user_key, base, user.profile)
+            if not line:
+                continue
+            if not await self.store.mark_reminded(
+                user.user_key, base.isoformat(), "rest_ahead"
+            ):
+                continue
+            await self._send_text(
+                user.umo,
+                f"🌇 今天辛苦啦，{user.nickname}\n"
+                f"{line}\n明天不用早起上班，今晚好好休息。",
+            )
+            return
+
+    async def _check_overtime_alert(self, user: UserRecord, now: datetime) -> None:
+        """上着班超过每日标准工时时，推送一次加班提醒（按天只发一次）。"""
+        for base in (now.date(), now.date() - timedelta(days=1)):
+            slot = await self._slot_for_day(user.user_key, base, user.profile)
+            if slot is None or slot.kind != "work":
+                continue
+            punches = await self.store.list_punches(
+                user.user_key, base.isoformat(), base.isoformat()
+            )
+            opened = next((item for item in reversed(punches) if item.is_open), None)
+            if opened is None:
+                continue
+            closed_minutes = sum(
+                max(0, int(item.minutes or 0)) for item in punches if not item.is_open
+            )
+            live_minutes = shift_minutes(
+                opened.start, _now_hhmm(), user.profile.break_minutes
+            )
+            worked = closed_minutes + max(0, live_minutes)
+            threshold = int(round(user.profile.standard_hours * 60))
+            if worked < threshold:
+                continue
+            if not await self.store.mark_reminded(
+                user.user_key, base.isoformat(), "overtime"
+            ):
+                return
+
+            month = f"{base:%Y-%m}"
+            _, summary = await self._month_stats(user.user_key, month, user.profile)
+            overtime_minutes = max(0, worked - threshold)
+            rate = float(summary.get("hourly_rate") or 0.0)
+            multiplier = float(user.profile.overtime_rate or 1.5)
+            if rate > 0:
+                extra = overtime_minutes / 60 * rate * max(0.0, multiplier - 1)
+                money_line = (
+                    f"已产生加班 {human_minutes(overtime_minutes)}，"
+                    f"比平时多约 ¥{extra:,.2f}（加班时薪约 ¥{rate * multiplier:g}/h）。"
+                )
+            else:
+                money_line = (
+                    f"已产生加班 {human_minutes(overtime_minutes)}，"
+                    "先设置工资才能算加班费。"
+                )
+            await self._send_text(
+                user.umo,
+                f"⏰ 加班提醒，{user.nickname}\n"
+                f"今天已经工作 {human_minutes(worked)}，超过每日标准 "
+                f"{user.profile.standard_hours:g} 小时。\n"
+                f"从现在起按 ×{multiplier:g} 计加班工资，{money_line}\n"
+                "收工记得发「/打卡 下班」。",
+            )
+            return
+
+    async def _weather_line(
+        self, user: UserRecord, kind: str, day: date, slot: DaySlot
+    ) -> str:
+        """AI 联网查询天气，返回一行可直接拼进提醒的文案；失败则返回空串。"""
+        if not bool(self.config.get("weather_reminder_enabled", True)):
+            return ""
+        if not user.weather_enabled:
+            return ""
+        city = str(user.weather_city or "").strip()
+        if not city:
+            return ""
+
+        cache_key = (user.user_key, f"{day.isoformat()}:{kind}", city)
+        ttl = max(5, int(self.config.get("weather_cache_minutes", 30) or 30)) * 60
+        cached = self._weather_cache.get(cache_key)
+        if cached and time.time() - cached[0] < ttl:
+            return cached[1]
+
+        try:
+            text = await asyncio.wait_for(
+                self._build_weather_line(user, kind, day, slot, city), timeout=45
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"排班工坊：{user.user_key} 天气查询超时")
+            text = ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"排班工坊：{user.user_key} 天气查询失败：{exc}")
+            text = ""
+        self._weather_cache[cache_key] = (time.time(), text)
+        return text
+
+    async def _build_weather_line(
+        self, user: UserRecord, kind: str, day: date, slot: DaySlot, city: str
+    ) -> str:
+        results = await self._search_weather(user, city, kind, day)
+        if not results:
+            return ""
+
+        get_provider = getattr(self.context, "get_using_provider_async", None)
+        llm_generate = getattr(self.context, "llm_generate", None)
+        if not get_provider or not llm_generate:
+            return ""
+        provider = await get_provider(user.umo or None)
+        if provider is None:
+            return ""
+        provider_id = provider.meta().id
+
+        date_text = f"{day.month}月{day.day}日"
+        when = "今天上班通勤时段" if kind == "in" else "今天傍晚下班和明天上班"
+        prompt = (
+            f"城市：{city}\n日期：{date_text}\n时段：{when}\n"
+            f"班次：{slot.start}-{slot.end}\n\n"
+            f"联网搜索结果：\n{results[:3000]}\n\n"
+            "请只根据上面的搜索结果，写一句 20~50 字的中文天气提醒。"
+            "包含天气现象、气温、是否需要带伞或添衣；不要链接、不要来源、不要 Markdown。"
+            "如果结果不足以判断天气，只输出：天气信息暂时没查到。"
+        )
+        response = await asyncio.wait_for(
+            llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                system_prompt=(
+                    "你是天气播报员。严格依据联网搜索结果，不补充常识、不编造温度；"
+                    "输出一行中文，不要解释。"
+                ),
+            ),
+            timeout=30,
+        )
+        text = re.sub(r"\s+", " ", str(response.completion_text or "")).strip()
+        text = text.strip("`*# \"'“”")
+        if not text or "没查到" in text or "无法" in text or "抱歉" in text:
+            return ""
+        if len(text) > 90:
+            text = text[:90].rstrip("，。；,; ") + "。"
+        return f"🌦 {city} · {text}"
+
+    async def _search_weather(
+        self, user: UserRecord, city: str, kind: str, day: date
+    ) -> str:
+        get_config = getattr(self.context, "get_config", None)
+        if not get_config:
+            return ""
+        cfg = get_config(umo=user.umo or None)
+        settings = cfg.get("provider_settings", {}) if hasattr(cfg, "get") else {}
+        if not settings.get("web_search", False):
+            return ""
+        provider_name = str(settings.get("websearch_provider", "tavily") or "tavily")
+        tool_names = {
+            "tavily": "web_search_tavily",
+            "bocha": "web_search_bocha",
+            "brave": "web_search_brave",
+            "firecrawl": "web_search_firecrawl",
+            "baidu_ai_search": "web_search_baidu",
+            "exa": "web_search_exa",
+            "anysearch": "web_search_anysearch",
+            "serpapi": "web_search_serpapi",
+            "deepseek": "web_search_deepseek",
+        }
+        tool_name = tool_names.get(provider_name, "web_search_tavily")
+        tool_mgr = self.context.get_llm_tool_manager()
+        tool = tool_mgr.get_builtin_tool(tool_name)
+        if tool is None:
+            return ""
+        runtime = SimpleNamespace(
+            context=SimpleNamespace(
+                context=self.context,
+                event=SimpleNamespace(unified_msg_origin=user.umo or ""),
+            )
+        )
+        when = "今天" if kind == "in" else "今天傍晚 明天"
+        query = f"{city} {when} 天气 气温 降雨 {day.month}月{day.day}日"
+        result = await asyncio.wait_for(tool.call(runtime, query=query), timeout=20)
+        text = result if isinstance(result, str) else str(result or "")
+        if not text or text.startswith("Error"):
+            return ""
+        return text
 
     def _in_window(self, now: datetime, target: datetime) -> bool:
         return target <= now < target + timedelta(minutes=self._REMIND_GRACE_MINUTES)
@@ -622,10 +947,18 @@ class ShiftBoardPlugin(Star):
     def shift_group(self):
         """排班表：生成、查看、切换月休方案、设置班次时间"""
 
-    @shift_group.command("帮助", alias={"help"})
+    @shift_group.command("帮助", alias={"help", "菜单", "指令"})
     async def shift_help(self, event: AstrMessageEvent):
-        """查看全部指令"""
-        yield event.plain_result(render.help_text())
+        """查看全部指令（优先发图片）"""
+        try:
+            url = await self.html_render(
+                render.help_html(), {}, return_url=True, umo=event.unified_msg_origin
+            )
+        except Exception as exc:  # noqa: BLE001 - t2i 服务未开时回退文本
+            logger.warning("帮助卡片渲染图片失败，回退文本：%s", exc)
+            yield event.plain_result(render.help_text())
+            return
+        yield event.image_result(url)
 
     @shift_group.command("生成", alias={"重排", "generate"})
     async def shift_generate(self, event: AstrMessageEvent):
@@ -749,6 +1082,105 @@ class ShiftBoardPlugin(Star):
             f"其余 {summary['work_days']} 天按 {profile.shift_start}-{profile.shift_end}"
             f"（{shift_type_label(profile)}）上班，计划 {human_minutes(summary['planned_minutes'])}。"
         )
+
+    @shift_group.command("请假", alias={"未上班", "不上班", "leave"})
+    async def shift_leave(self, event: AstrMessageEvent):
+        """把某几天标成未上班 / 请假；例：/排班 请假 10月1号到10月21号"""
+        user = await self._user(event)
+        args = _message_args(event)
+        current_month = f"{date.today():%Y-%m}"
+        if not args or args[0] in {"查看", "状态", "列表"}:
+            month = parse_month(args[1] if len(args) > 1 else current_month)
+            leaves = await self.store.get_leave_days(user.user_key, month)
+            if leaves:
+                detail = "、".join(f"{day}日" for day in leaves)
+                text = (
+                    f"{month_label(month)}已标记未上班/请假 {len(leaves)} 天：{detail}。\n"
+                    "这些天不计薪，月薪会按实际在职工作日折算。"
+                )
+            else:
+                text = f"{month_label(month)}还没有未上班/请假记录。"
+            yield event.plain_result(
+                text
+                + "\n标记：/排班 请假 10月1号到10月21号"
+                + "\n恢复：/排班 请假 恢复 10月1号到10月21号"
+            )
+            return
+
+        clearing = args[0] in {"恢复", "取消", "清除", "销假", "上班"}
+        payload = " ".join(args[1:]) if clearing else " ".join(args)
+        span = _parse_date_range(payload)
+        if span is None:
+            # 也接受「/排班 请假 5,6,7」这种本月日期
+            days = _parse_days(payload)
+            if not days:
+                yield event.plain_result(
+                    "没听懂日期，示例：/排班 请假 10月1号到10月21号\n"
+                    "恢复：/排班 请假 恢复 10月1号到10月21号"
+                )
+                return
+            month = current_month
+            start = end = None
+            groups = {month: days}
+        else:
+            start, end = span
+            month = f"{start:%Y-%m}"
+            groups = {}
+            current = start
+            while current <= end:
+                groups.setdefault(f"{current:%Y-%m}", []).append(current.day)
+                current += timedelta(days=1)
+
+        total = 0
+        skipped_rest: list[str] = []
+        skipped_punch: list[str] = []
+        for target_month, days in groups.items():
+            await self._ensure_month(user.user_key, target_month, user.profile)
+            if clearing:
+                total += await self.store.clear_leave_days(
+                    user.user_key, target_month, days
+                )
+                continue
+
+            for day in sorted(set(days)):
+                iso = f"{target_month}-{day:02d}"
+                slot = await self._slot_for_day(
+                    user.user_key, date.fromisoformat(iso), user.profile
+                )
+                if slot is None or slot.kind == "rest":
+                    skipped_rest.append(f"{int(target_month[5:7])}月{day}日")
+                    continue
+                punches = await self.store.list_punches(
+                    user.user_key, iso, iso
+                )
+                if punches:
+                    skipped_punch.append(f"{int(target_month[5:7])}月{day}日")
+                    continue
+                total += await self.store.set_leave_days(
+                    user.user_key, target_month, [day]
+                )
+
+        if clearing and groups:
+            for target_month in groups:
+                await self._rebuild_month(user.user_key, target_month, user.profile)
+
+        month = f"{start:%Y-%m}" if start else month
+        _, summary = await self._month_stats(user.user_key, month, user.profile)
+        action = "恢复为工作日" if clearing else "标记为未上班/请假"
+        lines = [f"✅ {month_label(month)}已{action} {total} 天。"]
+        if skipped_punch:
+            lines.append(
+                "有打卡记录、未处理：" + "、".join(skipped_punch)
+                + "（先删掉当天打卡再标记）"
+            )
+        if skipped_rest:
+            lines.append("本来就是休息日、未处理：" + "、".join(skipped_rest))
+        lines.append(
+            f"当前在职工作日 {summary['work_days']} 天，请假 {summary['leave_days']} 天，"
+            f"未上班 {summary['prejob_days']} 天。\n"
+            f"应发正常工资 ¥{summary['normal_pay']:,.2f}，全月预测 ¥{summary['projected_pay']:,.2f}。"
+        )
+        yield event.plain_result("\n".join(lines))
 
     @shift_group.command("罚款", alias={"扣款", "fine"})
     async def shift_fine(self, event: AstrMessageEvent):
@@ -1177,6 +1609,46 @@ class ShiftBoardPlugin(Star):
             + render.summary_block(summary)
         )
 
+    @pay_group.command("加班", alias={"overtime", "加班费"})
+    async def pay_overtime(self, event: AstrMessageEvent):
+        """设置加班倍率与每日标准工时：/工薪 加班 1.5 [8]"""
+        user = await self._user(event)
+        args = _message_args(event)
+        if not args:
+            yield event.plain_result(
+                f"当前加班 ×{user.profile.overtime_rate:g}，每日标准 "
+                f"{user.profile.standard_hours:g}h。\n"
+                "设置倍率：/工薪 加班 1.5\n"
+                "倍率和标准工时一起设：/工薪 加班 1.5 8"
+            )
+            return
+        multiplier = _number(args[0])
+        if multiplier is None or not 1.0 <= multiplier <= 10.0:
+            yield event.plain_result("加班倍率填 1 ~ 10，例如 /工薪 加班 1.5。")
+            return
+        standard = user.profile.standard_hours
+        if len(args) > 1:
+            value = _number(args[1])
+            if value is None or not 1 <= value <= 24:
+                yield event.plain_result("每日标准工时填 1 ~ 24 小时，例如 /工薪 加班 1.5 8。")
+                return
+            standard = value
+        updated = await self.store.update_profile(
+            user.user_key, overtime_rate=multiplier, standard_hours=standard
+        )
+        if updated is None:
+            yield event.plain_result("保存失败，请稍后再试。")
+            return
+        month = f"{date.today():%Y-%m}"
+        _, summary = await self._month_stats(updated.user_key, month, updated.profile)
+        yield event.plain_result(
+            f"✅ 加班倍率 ×{multiplier:g}，每天超过 {standard:g} 小时算加班。\n"
+            f"当前折算时薪 ¥{summary['hourly_rate']:g}/h，"
+            f"加班时薪约 ¥{summary['hourly_rate'] * multiplier:g}/h；"
+            f"本月已加班 {human_minutes(summary['overtime_minutes'])}。\n"
+            "需要上班时提醒：/提醒 加班 开"
+        )
+
     @pay_group.command("月薪", alias={"monthly", "月工资"})
     async def pay_monthly(self, event: AstrMessageEvent):
         """设置月薪：/工薪 月薪 5000"""
@@ -1295,6 +1767,101 @@ class ShiftBoardPlugin(Star):
         )
 
     # ------------------------------------------------------------------ #
+    # /扣款（每月固定扣款 / 自定义费用标签）
+    # ------------------------------------------------------------------ #
+    @filter.command_group("扣款", alias={"deduction", "固定扣款", "费用"})
+    def deduction_group(self):
+        """每月固定扣款：社保、水电、餐费、房租等自定义标签"""
+
+    @deduction_group.command("查看", alias={"列表", "list", "status"})
+    async def deduction_list(self, event: AstrMessageEvent):
+        """查看某个月生效的扣款明细"""
+        user = await self._user(event)
+        args = _message_args(event)
+        month = parse_month(args[0] if args else "")
+        items = await self.store.list_deductions(user.user_key, month)
+        _, summary = await self._month_stats(user.user_key, month, user.profile)
+        if not items:
+            yield event.plain_result(
+                f"🧾 {month_label(month)} 还没有固定扣款。\n"
+                "添加：/扣款 添加 房租 1500 每月\n"
+                "或：/扣款 添加 电费 120 本月"
+            )
+            return
+        lines = [f"🧾 {month_label(month)} 固定扣款："]
+        for item in items:
+            tag = "每月" if item["repeat_monthly"] else "本月一次"
+            lines.append(f"  #{item['id']} {item['name']} ¥{item['amount']:g}（{tag}）")
+        lines.append(
+            f"合计 -¥{summary['deduction_total']:g}，"
+            f"扣款前 ¥{summary['pay_before_deductions']:,.2f} → 到手 ¥{summary['total_pay']:,.2f}"
+        )
+        yield event.plain_result("\n".join(lines))
+
+    @deduction_group.command("添加", alias={"加", "add", "设置"})
+    async def deduction_add(self, event: AstrMessageEvent):
+        """添加每月扣款：/扣款 添加 房租 1500 每月"""
+        user = await self._user(event)
+        args = _message_args(event)
+        if len(args) < 2:
+            yield event.plain_result(
+                "格式：/扣款 添加 标签 金额 [每月|本月]\n"
+                "例如：/扣款 添加 房租 1500 每月\n"
+                "      /扣款 添加 水电费 120 本月"
+            )
+            return
+        name = args[0].strip()[:20]
+        amount = _number(args[1])
+        if not name or amount is None or amount <= 0:
+            yield event.plain_result("标签不能为空，金额要写正数，例如：/扣款 添加 餐费 600 每月")
+            return
+        if amount > 1000000:
+            yield event.plain_result("扣款金额太大，请确认后再添加。")
+            return
+        repeat = True
+        month = f"{date.today():%Y-%m}"
+        for token in args[2:]:
+            if token in {"单次", "一次", "本月", "once"}:
+                repeat = False
+            elif token in {"每月", "固定", "monthly"}:
+                repeat = True
+            elif re.match(r"^\d{4}-\d{1,2}$|^\d{1,2}$", token):
+                month = parse_month(token)
+        item = await self.store.add_deduction(
+            user.user_key, name, amount, month, repeat_monthly=repeat
+        )
+        _, summary = await self._month_stats(user.user_key, month, user.profile)
+        yield event.plain_result(
+            f"✅ 已添加扣款「{item['name']}」¥{amount:g}"
+            f"（{'每月' if repeat else '本月一次'}）。\n"
+            f"{month_label(month)}固定扣款合计 ¥{summary['deduction_total']:g}，"
+            f"到手 ¥{summary['total_pay']:,.2f}。"
+        )
+
+    @deduction_group.command("删除", alias={"删", "delete", "移除"})
+    async def deduction_delete(self, event: AstrMessageEvent):
+        """删除一笔扣款：/扣款 删除 3 或 /扣款 删除 房租"""
+        user = await self._user(event)
+        args = _message_args(event)
+        if not args:
+            yield event.plain_result("用法：/扣款 删除 3 或 /扣款 删除 房租")
+            return
+        token = " ".join(args).strip()
+        month = f"{date.today():%Y-%m}"
+        if token.isdigit():
+            removed = await self.store.delete_deduction(user.user_key, int(token))
+            if not removed:
+                yield event.plain_result("没有找到这个编号，先发「/扣款 查看」看列表。")
+                return
+        else:
+            item = await self.store.find_deduction_by_name(user.user_key, token, month)
+            if item is None:
+                yield event.plain_result("没有找到这个标签，先发「/扣款 查看」看列表。")
+                return
+            await self.store.delete_deduction(user.user_key, item["id"])
+        yield event.plain_result(f"🧹 已删除扣款「{token}」。")
+
+    # ------------------------------------------------------------------ #
     # /提醒
     # ------------------------------------------------------------------ #
     @filter.command_group("提醒", alias={"remind", "上下班提醒"})
@@ -1310,9 +1877,21 @@ class ShiftBoardPlugin(Star):
         yield event.plain_result(
             f"🔔 {user.nickname} 的上下班提醒：{state}\n"
             f"上班提前 {user.remind_before_start} 分钟 · 下班提前 {user.remind_before_end} 分钟\n"
+            f"自定义上班文案：{user.remind_in_text or '未设置（用默认温柔版）'}\n"
+            f"自定义下班文案：{user.remind_out_text or '未设置（用默认温柔版）'}\n"
+            f"天气城市：{user.weather_city or '未设置'} · 天气提醒：{'开' if user.weather_enabled else '关'}\n"
+            f"加班提醒：{'开' if user.overtime_alert_enabled else '关'}"
+            f" · 每日标准 {user.profile.standard_hours:g}h"
+            f" · 加班 ×{user.profile.overtime_rate:g}\n"
+            f"休息日提醒：{'开' if user.rest_reminder_enabled else '关'}"
+            "（今天上班、明天排休，下班后提醒一次）\n"
             f"推送会话：{channel}\n"
             "只有排班表里当天是「工作日」时才会提醒。\n"
-            "调整：/提醒 开｜/提醒 关｜/提醒 上班 30｜/提醒 下班 15"
+            "调整：/提醒 开｜/提醒 关｜/提醒 上班 30｜/提醒 下班 15\n"
+            "文案：/提醒 自定义 上班 早安 {nickname}，今天 {start}-{end}\n"
+            "天气：/提醒 城市 宜宾｜/提醒 天气 开｜/提醒 天气 关\n"
+            "加班提醒：/提醒 加班 开｜/提醒 加班 8｜/工薪 加班 1.5\n"
+            "休息日提醒：/提醒 休息 开｜/提醒 休息 关"
         )
 
     @remind_group.command("开", alias={"开启", "on"})
@@ -1369,6 +1948,180 @@ class ShiftBoardPlugin(Star):
             user.user_key, remind_before_end=minutes, remind_enabled=True
         )
         yield event.plain_result(f"⏰ 下班提醒已设为提前 {minutes} 分钟。")
+
+    @remind_group.command("自定义", alias={"文案", "custom"})
+    async def remind_custom(self, event: AstrMessageEvent):
+        """自定义上班 / 下班提醒文案"""
+        user = await self._user(event)
+        raw = _PREFIX_RE.sub("", getattr(event, "message_str", "") or "").strip()
+        parts = raw.split(maxsplit=3)
+        # parts: [提醒, 自定义, 上班/下班/清空/查看, 文案...]
+        target = parts[2] if len(parts) >= 3 else ""
+        content = parts[3].strip() if len(parts) >= 4 else ""
+
+        if target in {"查看", "看", "show", ""}:
+            yield event.plain_result(
+                "📝 当前自定义提醒文案：\n"
+                f"上班：{user.remind_in_text or '未设置（默认温柔版）'}\n"
+                f"下班：{user.remind_out_text or '未设置（默认温柔版）'}\n"
+                "可用占位符：{nickname} {date} {start} {end} {before} {minutes} {type} {greeting} {punch} {weather} {tomorrow}"
+            )
+            return
+
+        if target in {"清空", "清除", "默认", "reset"}:
+            await self.store.update_profile(
+                user.user_key, remind_in_text="", remind_out_text=""
+            )
+            yield event.plain_result("🧹 已清空自定义文案，恢复默认温柔版提醒。")
+            return
+
+        if target not in {"上班", "下班", "in", "out"}:
+            yield event.plain_result(
+                "用法：/提醒 自定义 上班 早安 {nickname}，今天 {start}-{end}\n"
+                "或：/提醒 自定义 下班 {nickname} 辛苦啦\n"
+                "清空：/提醒 自定义 清空"
+            )
+            return
+
+        field = "remind_in_text" if target in {"上班", "in"} else "remind_out_text"
+        if not content:
+            current = user.remind_in_text if field == "remind_in_text" else user.remind_out_text
+            yield event.plain_result(
+                f"当前{target}文案：{current or '未设置（默认温柔版）'}\n"
+                "用法：/提醒 自定义 上班 早安 {nickname}，今天 {start}-{end}\n"
+                "可用占位符：{nickname} {date} {start} {end} {before} {minutes} {type} {greeting} {punch} {weather} {tomorrow}"
+            )
+            return
+        if content in {"清空", "清除", "默认", "reset"}:
+            content = ""
+        if len(content) > 500:
+            yield event.plain_result("文案太长了，控制在 500 字以内。")
+            return
+        await self.store.update_profile(user.user_key, **{field: content})
+        yield event.plain_result(
+            f"✅ 已保存{target}自定义文案。\n"
+            f"下次会按这样发：\n{content or '（已恢复默认）'}\n"
+            "提示：把 {weather} 放进文案里，天气会显示在那一行；不写也会自动补在最后。"
+        )
+
+    @remind_group.command("城市", alias={"天气城市", "city"})
+    async def remind_city(self, event: AstrMessageEvent):
+        """设置天气城市（天气由 AI 联网搜索）"""
+        user = await self._user(event)
+        args = _message_args(event)
+        if not args or args[0] in {"查看", "看", "show"}:
+            yield event.plain_result(
+                f"🌦 当前天气城市：{user.weather_city or '未设置'}\n"
+                "设置：/提醒 城市 宜宾\n"
+                "需要一个城市名；设置后 AI 会在上下班提醒里联网查天气。"
+            )
+            return
+        city = " ".join(args).strip()[:40]
+        if city in {"关", "关闭", "off"}:
+            await self.store.update_profile(user.user_key, weather_enabled=False)
+            yield event.plain_result("🌦 已关闭天气提醒。")
+            return
+        await self.store.update_profile(
+            user.user_key, weather_city=city, weather_enabled=True
+        )
+        yield event.plain_result(
+            f"✅ 天气城市已设为「{city}」，上下班提醒会让 AI 联网查当天天气。\n"
+            "如果天气没出现，检查 AstrBot 的「联网搜索」是否已开启并配好搜索服务。"
+        )
+
+    @remind_group.command("天气", alias={"weather"})
+    async def remind_weather(self, event: AstrMessageEvent):
+        """开关天气提醒"""
+        user = await self._user(event)
+        args = _message_args(event)
+        if not args:
+            yield event.plain_result(
+                f"🌦 天气提醒：{'开' if user.weather_enabled else '关'} · 城市：{user.weather_city or '未设置'}\n"
+                "用法：/提醒 天气 开｜/提醒 天气 关｜/提醒 城市 宜宾"
+            )
+            return
+        action = args[0]
+        if action in {"开", "开启", "on"}:
+            if not user.weather_city:
+                yield event.plain_result("先用「/提醒 城市 宜宾」设置城市，再开天气提醒。")
+                return
+            await self.store.update_profile(user.user_key, weather_enabled=True)
+            yield event.plain_result(
+                f"🌦 天气提醒已开启，城市：{user.weather_city}。"
+            )
+            return
+        if action in {"关", "关闭", "off"}:
+            await self.store.update_profile(user.user_key, weather_enabled=False)
+            yield event.plain_result("🌦 天气提醒已关闭。")
+            return
+        yield event.plain_result("用法：/提醒 天气 开｜/提醒 天气 关")
+
+    @remind_group.command("加班", alias={"overtime", "加班提醒"})
+    async def remind_overtime(self, event: AstrMessageEvent):
+        """开关加班提醒，或设置每日标准工时：/提醒 加班 开｜/提醒 加班 8"""
+        user = await self._user(event)
+        args = _message_args(event)
+        if not args or args[0] in {"状态", "查看", "status"}:
+            yield event.plain_result(
+                f"⏰ 加班提醒：{'开' if user.overtime_alert_enabled else '关'}"
+                f" · 每日标准 {user.profile.standard_hours:g}h"
+                f" · 加班 ×{user.profile.overtime_rate:g}\n"
+                "改标准工时：/提醒 加班 8\n"
+                "开关：/提醒 加班 开｜/提醒 加班 关\n"
+                "改加班倍率：/工薪 加班 1.5"
+            )
+            return
+        action = args[0]
+        if action in {"开", "开启", "on"}:
+            await self.store.update_profile(user.user_key, overtime_alert_enabled=True)
+            yield event.plain_result(
+                f"⏰ 加班提醒已开启：每天超过 {user.profile.standard_hours:g} 小时后提醒一次。"
+            )
+            return
+        if action in {"关", "关闭", "off"}:
+            await self.store.update_profile(user.user_key, overtime_alert_enabled=False)
+            yield event.plain_result("⏰ 加班提醒已关闭，加班工资仍会照常计算。")
+            return
+        hours = _number(action)
+        if hours is None or not 1 <= hours <= 24:
+            yield event.plain_result(
+                "标准工时填 1 ~ 24 小时，例如 /提醒 加班 8；开关用 /提醒 加班 开|关。"
+            )
+            return
+        await self.store.update_profile(
+            user.user_key, standard_hours=hours, overtime_alert_enabled=True
+        )
+        yield event.plain_result(
+            f"⏰ 已把每日标准工时设为 {hours:g} 小时；超过后按 "
+            f"×{user.profile.overtime_rate:g} 计加班，并在上班时提醒一次。"
+        )
+
+    @remind_group.command("休息", alias={"休息日", "rest"})
+    async def remind_rest(self, event: AstrMessageEvent):
+        """休息日提醒：只在前一天上班、后一天排休时，下班后提醒。"""
+        user = await self._user(event)
+        args = _message_args(event)
+        action = args[0] if args else ""
+        if not action or action in {"查看", "状态", "status"}:
+            state = "开" if user.rest_reminder_enabled else "关"
+            yield event.plain_result(
+                f"🌙 休息日提醒：{state}\n"
+                "只按排班表判断：今天上班、明天排休，才会在下班后提醒一次；"
+                "周六周日即使休息，只要排班表写着上班，就不会提醒。\n"
+                "开关：/提醒 休息 开｜/提醒 休息 关"
+            )
+            return
+        if action in {"开", "开启", "on"}:
+            await self.store.update_profile(user.user_key, rest_reminder_enabled=True)
+            yield event.plain_result(
+                "🌙 休息日提醒已开启：今天这班结束后、明天排休时，我会提醒你。"
+            )
+            return
+        if action in {"关", "关闭", "off"}:
+            await self.store.update_profile(user.user_key, rest_reminder_enabled=False)
+            yield event.plain_result("🌙 休息日提醒已关闭。")
+            return
+        yield event.plain_result("用法：/提醒 休息 开｜/提醒 休息 关")
 
     # ------------------------------------------------------------------ #
     # LLM 函数工具（让机器人 AI 在聊天里自己调用）
@@ -1499,11 +2252,14 @@ class ShiftBoardPlugin(Star):
             rate_line = (
                 f"月薪 ¥{user.profile.monthly_salary:,.2f}"
                 f"（按本月计划 {human_minutes(summary['planned_minutes'])} 折算 ¥{summary['hourly_rate']:g}/h），"
-                f"加班倍率 ×{user.profile.overtime_rate:g}\n"
+                f"每日超 {user.profile.standard_hours:g}h 算加班，倍率 ×{user.profile.overtime_rate:g}\n"
             )
             normal_line = f"月薪基数 ¥{summary['normal_pay']:,.2f}\n"
         else:
-            rate_line = f"时薪 ¥{user.profile.hourly_rate:g}/h，加班倍率 ×{user.profile.overtime_rate:g}\n"
+            rate_line = (
+                f"时薪 ¥{user.profile.hourly_rate:g}/h，每日超 "
+                f"{user.profile.standard_hours:g}h 算加班，倍率 ×{user.profile.overtime_rate:g}\n"
+            )
             normal_line = (
                 f"正常 {human_minutes(summary['normal_minutes'])} × 时薪"
                 f" = ¥{summary['normal_pay']:,.2f}\n"
@@ -1515,7 +2271,40 @@ class ShiftBoardPlugin(Star):
             + f"加班 {human_minutes(summary['overtime_minutes'])} = ¥{summary['overtime_pay']:,.2f}\n"
             f"缺勤 {summary['absence_days']} 天，扣款 ¥{summary['absence_deduction']:,.2f}\n"
             f"罚款 ¥{summary['fine_total']:g}\n"
-            f"实发 ¥{summary['total_pay']:,.2f}，全月干满预计 ¥{summary['projected_pay']:,.2f}"
+            + (
+                f"固定扣款 ¥{summary['deduction_total']:g}（"
+                + "、".join(
+                    f"{item['name']} {item['amount']:g}"
+                    for item in summary["deduction_items"]
+                )
+                + "）\n"
+                if summary.get("deduction_items")
+                else ""
+            )
+            + f"到手 ¥{summary['total_pay']:,.2f}，全月干满预计 ¥{summary['projected_pay']:,.2f}"
+        )
+
+    @filter.llm_tool("shift_get_profile")
+    async def ai_get_profile(self, event: AstrMessageEvent) -> str:
+        """查询当前说话人的全部设置：月休方案、班次、扣休、工资口径、上下班提醒、自定义文案和天气城市。"""
+        user = await self._user(event)
+        profile = user.profile
+        pay = (
+            f"月薪 ¥{profile.monthly_salary:,.2f}（折算 ¥{profile.hourly_rate:g}/h）"
+            if profile.pay_mode == "monthly" and profile.monthly_salary > 0
+            else f"时薪 ¥{profile.hourly_rate:g}/h"
+        )
+        return (
+            f"{user.nickname} · 当前设置\n"
+            f"月休 {profile.rest_mode} 天，班次 {profile.shift_start}-{profile.shift_end}"
+            f"（{shift_type_label(profile)}），每班扣休 {profile.break_minutes} 分钟\n"
+            f"计薪 {pay}，每日标准 {profile.standard_hours:g}h，加班倍率 ×{profile.overtime_rate:g}，"
+            f"加班提醒 {'开' if user.overtime_alert_enabled else '关'}\n"
+            f"提醒 {'开启' if user.remind_enabled else '关闭'}：上班提前 {user.remind_before_start} 分钟，"
+            f"下班提前 {user.remind_before_end} 分钟\n"
+            f"自定义上班文案：{user.remind_in_text or '未设置（默认温柔版）'}\n"
+            f"自定义下班文案：{user.remind_out_text or '未设置（默认温柔版）'}\n"
+            f"天气 {'开启' if user.weather_enabled else '关闭'}，城市：{user.weather_city or '未设置'}"
         )
 
     @filter.llm_tool("shift_set_pay")
@@ -1595,6 +2384,114 @@ class ShiftBoardPlugin(Star):
             f"{month_label(month)}实发 ¥{summary['total_pay']:,.2f}，全月预计 ¥{summary['projected_pay']:,.2f}"
         )
 
+    @filter.llm_tool("shift_set_reminder")
+    async def ai_set_reminder(
+        self,
+        event: AstrMessageEvent,
+        enabled: str = "",
+        before_start: str = "",
+        before_end: str = "",
+        custom_in: str = "",
+        custom_out: str = "",
+        weather_city: str = "",
+        weather_enabled: str = "",
+        rest_enabled: str = "",
+    ) -> str:
+        """设置当前说话人的上下班提醒：开关、提前分钟数、自定义上/下班文案、天气城市和天气开关。
+        只有用户本轮明确要求修改提醒、文案或天气城市时才调用，不要自行改动。
+        文案支持占位符 {nickname} {date} {start} {end} {before} {minutes} {type} {greeting} {punch} {weather} {tomorrow}；
+        用户说“恢复默认/清空文案”时，把 custom_in / custom_out 填「清空」。
+
+        Args:
+            enabled(string): 提醒总开关，填 开 / 关；不改就留空。
+            before_start(string): 上班提前分钟数，0~240；不改就留空。
+            before_end(string): 下班提前分钟数，0~240；不改就留空。
+            custom_in(string): 上班自定义文案，最多 500 字；填「清空」恢复默认。
+            custom_out(string): 下班自定义文案，最多 500 字；填「清空」恢复默认。
+            weather_city(string): 天气城市，如「宜宾」；填「关」表示关闭天气提醒。
+            weather_enabled(string): 天气开关，填 开 / 关；不改就留空。
+            rest_enabled(string): 休息日提醒开关，填 开 / 关；只有今天上班、明天排休才提醒。
+        """
+        if not bool(self.config.get("enable_ai_remind", True)):
+            return "管理员没有开启「允许 AI 改提醒」，这次没有写库。可以让用户发 /提醒 自定义 或 /提醒 城市。"
+
+        user = await self._user(event)
+        updates: dict[str, object] = {}
+        notes: list[str] = []
+
+        def _bool_value(raw: str) -> bool | None:
+            token = str(raw or "").strip().lower()
+            if token in {"开", "开启", "启用", "是", "on", "true", "1"}:
+                return True
+            if token in {"关", "关闭", "禁用", "否", "off", "false", "0"}:
+                return False
+            return None
+
+        flag = _bool_value(enabled)
+        if flag is not None:
+            updates["remind_enabled"] = flag
+            notes.append("提醒" + ("开启" if flag else "关闭"))
+        for key, raw, label in (
+            ("remind_before_start", before_start, "上班提前"),
+            ("remind_before_end", before_end, "下班提前"),
+        ):
+            if str(raw or "").strip():
+                value = _number(raw)
+                if value is None or value < 0 or value > 240:
+                    return f"{label}分钟要在 0~240 之间，这次没有写库。"
+                updates[key] = int(value)
+                notes.append(f"{label} {int(value)} 分钟")
+
+        for key, raw, label in (
+            ("remind_in_text", custom_in, "上班文案"),
+            ("remind_out_text", custom_out, "下班文案"),
+        ):
+            text_value = str(raw or "").strip()
+            if not text_value:
+                continue
+            if text_value in {"清空", "清除", "默认", "恢复默认", "reset"}:
+                text_value = ""
+            if len(text_value) > 500:
+                return f"{label}太长了，控制在 500 字以内，这次没有写库。"
+            updates[key] = text_value
+            notes.append(label + ("已清空" if not text_value else "已更新"))
+
+        city_text = str(weather_city or "").strip()
+        if city_text:
+            if city_text in {"关", "关闭", "off"}:
+                updates["weather_enabled"] = False
+                notes.append("天气提醒关闭")
+            else:
+                if len(city_text) > 40:
+                    return "城市名太长了，这次没有写库。"
+                updates["weather_city"] = city_text
+                updates["weather_enabled"] = True
+                notes.append(f"天气城市「{city_text}」")
+        weather_flag = _bool_value(weather_enabled)
+        if weather_flag is not None:
+            updates["weather_enabled"] = weather_flag
+            notes.append("天气提醒" + ("开启" if weather_flag else "关闭"))
+        rest_flag = _bool_value(rest_enabled)
+        if rest_flag is not None:
+            updates["rest_reminder_enabled"] = rest_flag
+            notes.append("休息日提醒" + ("开启" if rest_flag else "关闭"))
+
+        if not updates:
+            return (
+                "没有听到要改的提醒内容。可以说「上班提醒提前30分钟」「上班文案改成早安{nickname}」"
+                "「天气城市设成宜宾」或「关掉天气提醒」。"
+            )
+        updated = await self.store.update_profile(user.user_key, **updates)
+        if updated is None:
+            return "保存失败，请稍后再试。"
+        return (
+            "已更新：" + "、".join(notes) + "\n"
+            f"提醒{'开启' if updated.remind_enabled else '关闭'}，"
+            f"上班提前 {updated.remind_before_start} 分钟、下班提前 {updated.remind_before_end} 分钟\n"
+            f"天气{'开启' if updated.weather_enabled else '关闭'}，城市：{updated.weather_city or '未设置'}\n"
+            "天气由 AstrBot 联网搜索生成；没开联网搜索时天气会静默不显示。"
+        )
+
     @filter.llm_tool("shift_punch")
     async def ai_punch(self, event: AstrMessageEvent, action: str = "状态") -> str:
         """给当前说话人打卡（只有用户本轮明确说要打卡时才调用，不要自行推测）。
@@ -1661,6 +2558,29 @@ class ShiftBoardPlugin(Star):
         return (
             f"{user.nickname} 下班打卡 {closed.end}，本段 {human_minutes(closed.minutes)}"
             f"（{closed.start}-{closed.end}）。{money}。"
+        )
+
+    @filter.llm_tool("shift_delete_punch")
+    async def ai_delete_punch(self, event: AstrMessageEvent, day_text: str = "") -> str:
+        """删除当前说话人某一天的全部打卡记录（不可恢复）。
+        只有用户本轮明确说「删掉某天打卡 / 清空某天记录」时才调用；没给具体日期就先问，不要猜。
+
+        Args:
+            day_text(string): 日期，如 "11-20" / "2026-11-20" / "今天" / "昨天"。
+        """
+        if not bool(self.config.get("enable_ai_punch_delete", False)):
+            return "管理员没有开启「允许 AI 删除打卡」，这次没有删。可以让用户发 /打卡 删 11-20。"
+
+        user = await self._user(event)
+        day = _parse_day_token(day_text)
+        if day is None:
+            return "没听清具体日期，请用户说清楚要删哪一天，例如 11-20 或 昨天。"
+        removed = await self.store.delete_day_punches(user.user_key, day.isoformat())
+        if not removed:
+            return f"{day.month}/{day.day} 本来就没有打卡记录，不用删除。"
+        return (
+            f"已删除 {day.month}/{day.day} 的 {removed} 条打卡，"
+            "当天工时和工资统计已同步更新。"
         )
 
     @filter.llm_tool("shift_bulk_punch")
@@ -1893,6 +2813,161 @@ class ShiftBoardPlugin(Star):
             f"正常+加班 ¥{summary['gross_pay']:,.2f}，扣罚款后实发 ¥{summary['total_pay']:,.2f}"
         )
 
+    @filter.llm_tool("shift_get_deductions")
+    async def ai_get_deductions(self, event: AstrMessageEvent, month: str = "") -> str:
+        """查询当前说话人某个月的固定扣款明细与扣款后到手工资。
+
+        Args:
+            month(string): 月份，格式 YYYY-MM；留空表示本月。
+        """
+        user = await self._user(event)
+        target = parse_month(month)
+        items = await self.store.list_deductions(user.user_key, target)
+        _, summary = await self._month_stats(user.user_key, target, user.profile)
+        if not items:
+            return (
+                f"{month_label(target)}还没有固定扣款。\n"
+                "如果用户提到社保、水电、餐费、房租等每月固定支出，可以帮用户添加。"
+            )
+        lines = [f"{month_label(target)}固定扣款："]
+        for item in items:
+            tag = "每月" if item["repeat_monthly"] else "仅本月"
+            lines.append(
+                f"#{item['id']} {item['name']} ¥{item['amount']:g}（{tag}）"
+            )
+        lines.append(
+            f"合计 -¥{summary['deduction_total']:g}；"
+            f"扣款前 ¥{summary['pay_before_deductions']:,.2f}，"
+            f"到手 ¥{summary['total_pay']:,.2f}"
+        )
+        return "\n".join(lines)
+
+    @filter.llm_tool("shift_add_deduction")
+    async def ai_add_deduction(
+        self,
+        event: AstrMessageEvent,
+        name: str,
+        amount: str,
+        repeat: str = "",
+        month: str = "",
+    ) -> str:
+        """给用户添加一笔每月扣款，标签完全由用户决定，例如房租、社保、水电费、餐费。
+        只有用户明确说出标签和金额后才调用；金额不清楚时先问用户，不要猜。
+
+        Args:
+            name(string): 用户自定义的扣款标签，如 "房租"、"社保"、"水电费"、"餐费"。
+            amount(string): 金额数字，如 "1500"、"120"。
+            repeat(string): 是否每月重复，填 "每月" 或 "本月一次"；留空默认每月。
+            month(string): 起始月份 YYYY-MM；留空表示本月。
+        """
+        if not bool(self.config.get("enable_ai_deduction", True)):
+            return "管理员没有开启「允许 AI 管理扣款」，这次没有写库。可以让用户发 /扣款 添加 标签 金额。"
+        user = await self._user(event)
+        label = str(name or "").strip()[:20]
+        if not label:
+            return "扣款标签为空，请用户给一个名称，例如房租、社保、水电费。"
+        value = _number(amount)
+        if value is None or value <= 0:
+            return "没听清扣款金额，请用户再说一次具体数字。"
+        if value > 1000000:
+            return "金额看起来不合理，请用户确认后再说一次。"
+        target = parse_month(month)
+        raw_repeat = str(repeat or "").strip()
+        monthly = not any(
+            word in raw_repeat for word in ("本月一次", "单次", "一次", "只扣本月")
+        )
+        item = await self.store.add_deduction(
+            user.user_key, label, value, target, repeat_monthly=monthly
+        )
+        _, summary = await self._month_stats(user.user_key, target, user.profile)
+        return (
+            f"已添加扣款「{item['name']}」¥{value:g}（{'每月固定' if monthly else '仅本月一次'}）\n"
+            f"{month_label(target)}扣款合计 ¥{summary['deduction_total']:g}，"
+            f"到手 ¥{summary['total_pay']:,.2f}"
+        )
+
+    @filter.llm_tool("shift_delete_deduction")
+    async def ai_delete_deduction(
+        self, event: AstrMessageEvent, target: str, month: str = ""
+    ) -> str:
+        """删除用户的一笔扣款，可以按编号或标签删除。
+
+        Args:
+            target(string): 扣款编号（如 "3"）或标签（如 "房租"）。
+            month(string): 月份 YYYY-MM；留空表示本月。
+        """
+        if not bool(self.config.get("enable_ai_deduction", True)):
+            return "管理员没有开启「允许 AI 管理扣款」，这次没有删除。可以让用户发 /扣款 删除 标签。"
+        user = await self._user(event)
+        token = str(target or "").strip()
+        current = parse_month(month)
+        if not token:
+            return "请用户说明要删除哪一笔扣款，可以给编号或标签。"
+        if token.isdigit():
+            removed = await self.store.delete_deduction(user.user_key, int(token))
+            if not removed:
+                return f"没有找到编号 {token} 的扣款。"
+            return f"已删除扣款 #{token}。"
+        item = await self.store.find_deduction_by_name(user.user_key, token, current)
+        if item is None:
+            return f"没有找到标签「{token}」的扣款。"
+        await self.store.delete_deduction(user.user_key, item["id"])
+        return f"已删除扣款「{token}」¥{item['amount']:g}。"
+
+    @filter.llm_tool("shift_set_overtime")
+    async def ai_set_overtime(
+        self,
+        event: AstrMessageEvent,
+        multiplier: str = "",
+        standard_hours: str = "",
+        alert: str = "",
+    ) -> str:
+        """设置加班倍率、每日标准工时，以及是否开启加班提醒。
+        只有用户明确提到加班费倍率、8 小时标准或开关加班提醒时才调用。
+
+        Args:
+            multiplier(string): 加班倍率，如 "1.5"；留空不改。
+            standard_hours(string): 每日标准工时，如 "8"；留空不改。
+            alert(string): 加班提醒开关，填 "开" 或 "关"；留空不改。
+        """
+        if not bool(self.config.get("enable_ai_pay", True)):
+            return "管理员没有开启「允许 AI 改工资设置」，这次没有写库。可以让用户发 /工薪 加班 1.5。"
+        user = await self._user(event)
+        fields: dict[str, object] = {}
+        value = _number(multiplier)
+        if value is not None:
+            if not 1 <= value <= 10:
+                return "加班倍率要在 1 ~ 10 之间。"
+            fields["overtime_rate"] = value
+        hours = _number(standard_hours)
+        if hours is not None:
+            if not 1 <= hours <= 24:
+                return "每日标准工时要在 1 ~ 24 小时之间。"
+            fields["standard_hours"] = hours
+        action = str(alert or "").strip()
+        if action in {"开", "开启", "on"}:
+            fields["overtime_alert_enabled"] = True
+        elif action in {"关", "关闭", "off"}:
+            fields["overtime_alert_enabled"] = False
+        if not fields:
+            return (
+                f"当前加班 ×{user.profile.overtime_rate:g}，每日标准 "
+                f"{user.profile.standard_hours:g}h，加班提醒"
+                f"{'开' if user.overtime_alert_enabled else '关'}。"
+            )
+        updated = await self.store.update_profile(user.user_key, **fields)
+        if updated is None:
+            return "保存失败，请稍后再试。"
+        month = f"{date.today():%Y-%m}"
+        _, summary = await self._month_stats(updated.user_key, month, updated.profile)
+        return (
+            f"已更新：加班 ×{updated.profile.overtime_rate:g}，每日标准 "
+            f"{updated.profile.standard_hours:g}h，加班提醒"
+            f"{'开' if updated.overtime_alert_enabled else '关'}。\n"
+            f"本月已加班 {human_minutes(summary['overtime_minutes'])}，"
+            f"加班时薪约 ¥{summary['hourly_rate'] * updated.profile.overtime_rate:g}/h。"
+        )
+
     # ------------------------------------------------------------------ #
     # WebUI API
     # ------------------------------------------------------------------ #
@@ -1964,6 +3039,15 @@ class ShiftBoardPlugin(Star):
                 if not 1 <= overtime <= 10:
                     return error_response("加班倍率需在 1 ~ 10 之间")
                 fields["overtime_rate"] = overtime
+            if "standard_hours" in payload:
+                standard = float(payload["standard_hours"])
+                if not 1 <= standard <= 24:
+                    return error_response("每日标准工时需在 1 ~ 24 小时之间")
+                fields["standard_hours"] = standard
+            if "overtime_alert_enabled" in payload:
+                fields["overtime_alert_enabled"] = bool(payload["overtime_alert_enabled"])
+            if "rest_reminder_enabled" in payload:
+                fields["rest_reminder_enabled"] = bool(payload["rest_reminder_enabled"])
             if "shift_start" in payload:
                 fields["shift_start"] = normalize_hhmm(payload["shift_start"], "09:00")
             if "shift_end" in payload:
@@ -1996,6 +3080,14 @@ class ShiftBoardPlugin(Star):
                 if not 0 <= before_end <= 240:
                     return error_response("下班提醒提前分钟需在 0 ~ 240 之间")
                 fields["remind_before_end"] = before_end
+            if "remind_in_text" in payload:
+                fields["remind_in_text"] = str(payload["remind_in_text"] or "").strip()[:500]
+            if "remind_out_text" in payload:
+                fields["remind_out_text"] = str(payload["remind_out_text"] or "").strip()[:500]
+            if "weather_city" in payload:
+                fields["weather_city"] = str(payload["weather_city"] or "").strip()[:40]
+            if "weather_enabled" in payload:
+                fields["weather_enabled"] = bool(payload["weather_enabled"])
         except (TypeError, ValueError):
             return error_response("参数格式不正确")
 
@@ -2093,6 +3185,90 @@ class ShiftBoardPlugin(Star):
         if day is None:
             return error_response("日期格式应为 YYYY-MM-DD")
         await self.store.delete_day_punches(user_key, day.isoformat())
+        return json_response(await self._snapshot(user_key, month))
+
+    async def api_day_mark(self):
+        """标记某天未上班/请假，或恢复为工作日。"""
+        payload = await request.json(default={})
+        user_key = str(payload.get("user") or "")
+        record = await self.store.get_user(user_key)
+        if record is None:
+            return error_response("找不到这个用户", status_code=404)
+        day = _parse_day_token(str(payload.get("date") or ""))
+        if day is None:
+            return error_response("日期格式应为 YYYY-MM-DD")
+        month = f"{day:%Y-%m}"
+        action = str(payload.get("action") or "leave").strip().lower()
+        if action not in {"leave", "clear"}:
+            return error_response("action 只支持 leave / clear")
+        slot = await self._slot_for_day(user_key, day, record.profile)
+        if slot is None:
+            return error_response("这一天不在排班表里", status_code=404)
+        if action == "clear":
+            await self.store.clear_leave_days(user_key, month, [day.day])
+            await self._rebuild_month(user_key, month, record.profile)
+            return json_response(await self._snapshot(user_key, month))
+        if slot.kind == "rest":
+            return error_response("这天本来就是休息日，不用标记未上班/请假")
+        if await self.store.list_punches(user_key, day.isoformat(), day.isoformat()):
+            return error_response("这天已有打卡记录，先删掉打卡再标记未上班/请假")
+        await self.store.set_leave_days(user_key, month, [day.day])
+        return json_response(await self._snapshot(user_key, month))
+
+    # ------------------------------------------------------------------ #
+    # WebUI 每月扣款
+    # ------------------------------------------------------------------ #
+    async def api_deduction_save(self):
+        payload = await request.json(default={})
+        user_key = str(payload.get("user") or "")
+        record = await self.store.get_user(user_key)
+        if record is None:
+            return error_response("找不到这个用户", status_code=404)
+        name = str(payload.get("name") or "").strip()[:20]
+        if not name:
+            return error_response("扣款标签不能为空")
+        try:
+            amount = float(payload.get("amount"))
+        except (TypeError, ValueError):
+            return error_response("扣款金额要填数字")
+        if not 0 < amount <= 1000000:
+            return error_response("扣款金额需在 0 ~ 1000000 之间")
+        month = parse_month(payload.get("month", ""))
+        repeat = bool(payload.get("repeat_monthly", True))
+        deduction_id = payload.get("id")
+        try:
+            if deduction_id not in (None, ""):
+                updated = await self.store.update_deduction(
+                    user_key,
+                    int(deduction_id),
+                    name=name,
+                    amount=amount,
+                    repeat_monthly=repeat,
+                    month=month,
+                )
+                if updated is None:
+                    return error_response("这笔扣款不存在", status_code=404)
+            else:
+                await self.store.add_deduction(
+                    user_key, name, amount, month, repeat_monthly=repeat
+                )
+        except ValueError as exc:
+            return error_response(str(exc))
+        return json_response(await self._snapshot(user_key, month))
+
+    async def api_deduction_delete(self):
+        payload = await request.json(default={})
+        user_key = str(payload.get("user") or "")
+        record = await self.store.get_user(user_key)
+        if record is None:
+            return error_response("找不到这个用户", status_code=404)
+        try:
+            deduction_id = int(payload.get("id"))
+        except (TypeError, ValueError):
+            return error_response("扣款 ID 不正确")
+        if not await self.store.delete_deduction(user_key, deduction_id):
+            return error_response("这笔扣款不存在", status_code=404)
+        month = parse_month(payload.get("month", ""))
         return json_response(await self._snapshot(user_key, month))
 
     # ------------------------------------------------------------------ #

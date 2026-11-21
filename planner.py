@@ -34,6 +34,7 @@ class Profile:
     monthly_salary: float = 0.0
     pay_mode: str = "hourly"
     overtime_rate: float = 1.5
+    standard_hours: float = 8.0
     absence_deduction: bool = False
     rest_day_as_overtime: bool = True
 
@@ -49,6 +50,7 @@ class Profile:
         if pay_mode == "monthly" and monthly <= 0:
             pay_mode = "hourly"
         overtime = max(1.0, float(self.overtime_rate or 1.0))
+        standard_hours = max(1.0, min(float(self.standard_hours or 8.0), 24.0))
         return Profile(
             rest_mode=rest_mode,
             shift_start=normalize_hhmm(self.shift_start, "09:00"),
@@ -59,6 +61,7 @@ class Profile:
             monthly_salary=monthly,
             pay_mode=pay_mode,
             overtime_rate=overtime,
+            standard_hours=standard_hours,
             absence_deduction=bool(self.absence_deduction),
             rest_day_as_overtime=bool(self.rest_day_as_overtime),
         )
@@ -73,7 +76,7 @@ class DaySlot:
     """排班表中的一天。"""
 
     day: str  # ISO 日期，YYYY-MM-DD
-    kind: str  # work / rest
+    kind: str  # work / rest / leave
     start: str = ""
     end: str = ""
     planned_minutes: int = 0
@@ -119,6 +122,10 @@ class DayStats:
 
     @property
     def status(self) -> str:
+        if self.kind == "leave":
+            return "leave"
+        if self.kind == "prejob":
+            return "done" if self.attended else "prejob"
         if self.kind == "rest":
             return "overtime" if self.actual_minutes else "rest"
         if self.attended:
@@ -407,25 +414,26 @@ def summarize(
     today: date | None = None,
     month_complete: bool = False,
     fine_total: float = 0.0,
+    deductions: list[dict] | None = None,
 ) -> dict:
     """把排班和打卡揉成一份可直接展示的统计。
 
     - 计划工时：排班工作日 × 每日工时
-    - 正常工时：每天 min(实际, 计划)
-    - 加班工时：每天 max(0, 实际 - 计划)；排休日打卡按配置整段算加班
+    - 标准工时：每天超过「每日标准工时」的部分算加班，默认 8 小时
+    - 正常工时：每天 min(实际, 计划, 标准工时)
+    - 加班工时：每天超过标准工时的部分；排休日打卡按配置整段算加班
     - 缺勤工时：已过去的工作日里完全没有打卡的那几天
-    - 罚款：本月累计罚款金额，直接从实发里扣掉
+    - 罚款 / 每月固定扣款：从应发里扣掉，得到最终到手
     """
     profile = profile.normalized()
     today = today or date.today()
+    standard_minutes = int(round(profile.standard_hours * 60))
     grouped: dict[str, list[Punch]] = {}
     for punch in punches:
         grouped.setdefault(punch.day, []).append(punch)
 
-    # 没有任何打卡时不算缺勤，避免新用户一进来就被扣一个月工资
-    first_punch_day = min(
-        (punch.day for punch in punches if not punch.is_open), default=None
-    )
+    # 第一次出现打卡（含进行中）的日期；这之前的排班视为「还没上班」
+    first_punch_day = min((punch.day for punch in punches), default=None)
 
     day_stats: list[DayStats] = []
     for slot in slots:
@@ -434,19 +442,27 @@ def summarize(
         is_future = current > today
         day_punches = grouped.get(slot.day, [])
         actual = sum(max(0, int(p.minutes or 0)) for p in day_punches if not p.is_open)
-        planned = slot.planned_minutes if slot.is_work else 0
+        # 未上班 / 请假仍然保留原班次信息，方便展示和恢复；只是不计入有效工作日
+        effective_kind = slot.kind
+        if effective_kind == "work" and first_punch_day and slot.day < first_punch_day:
+            effective_kind = "prejob"
+        planned = slot.planned_minutes
 
-        if slot.is_work:
-            normal = min(actual, planned)
-            overtime = max(0, actual - planned)
-        else:
+        if effective_kind == "work":
+            base = min(planned, standard_minutes)
+            normal = min(actual, base)
+            overtime = max(0, actual - base)
+        elif effective_kind == "rest":
             normal = 0
             overtime = actual if profile.rest_day_as_overtime else 0
+        else:
+            normal = 0
+            overtime = 0
 
         attended = actual > 0
-        # 今天还没下班时不算缺勤；未来和排休日也不算
+        # 今天还没下班时不算缺勤；未来、排休、未上班和请假都不算
         absent = bool(
-            slot.is_work
+            effective_kind == "work"
             and not is_today
             and not is_future
             and actual == 0
@@ -461,7 +477,7 @@ def summarize(
             DayStats(
                 day=slot.day,
                 weekday=slot.weekday,
-                kind=slot.kind,
+                kind=effective_kind,
                 start=slot.start,
                 end=slot.end,
                 planned_minutes=planned,
@@ -478,14 +494,23 @@ def summarize(
 
     work_days = sum(1 for s in day_stats if s.kind == "work")
     rest_days = sum(1 for s in day_stats if s.kind == "rest")
+    leave_days = sum(1 for s in day_stats if s.kind == "leave")
+    prejob_days = sum(1 for s in day_stats if s.kind == "prejob")
+    contract_work_days = work_days + leave_days + prejob_days
     attended_days = sum(1 for s in day_stats if s.attended)
     work_attended_days = sum(1 for s in day_stats if s.attended and s.kind == "work")
     absence_days = sum(1 for s in day_stats if s.absent)
     overtime_rest_days = sum(1 for s in day_stats if s.kind == "rest" and s.attended)
 
-    planned_total = sum(s.planned_minutes for s in day_stats)
+    planned_total = sum(s.planned_minutes for s in day_stats if s.kind == "work")
+    # 合同口径：包含未上班和请假的原班次，用来把月薪折算成时薪和日薪
+    contract_planned_total = sum(
+        s.planned_minutes for s in day_stats if s.kind != "rest"
+    )
     planned_elapsed = sum(
-        s.planned_minutes for s in day_stats if not s.is_future and not s.is_today
+        s.planned_minutes
+        for s in day_stats
+        if s.kind == "work" and not s.is_future and not s.is_today
     )
     actual_total = sum(s.actual_minutes for s in day_stats)
     normal_total = sum(s.normal_minutes for s in day_stats)
@@ -497,26 +522,43 @@ def summarize(
     monthly_mode = (
         profile.pay_mode == "monthly"
         and profile.monthly_salary > 0
-        and planned_total > 0
-        and work_days > 0
+        and contract_planned_total > 0
+        and contract_work_days > 0
     )
     if monthly_mode:
-        # 月薪制：按全月计划工时把月薪折算成时薪，用于加班和缺勤扣款
-        rate = profile.monthly_salary / (planned_total / 60)
+        # 月薪制：按全月合同工作日折算时薪；未上班和请假的天数不计薪
+        rate = profile.monthly_salary / (contract_planned_total / 60)
     normal_pay = normal_total / 60 * rate
     overtime_pay = overtime_total / 60 * rate * overtime_rate
     absence_deduction = (absence_minutes / 60 * rate) if profile.absence_deduction else 0.0
     if monthly_mode:
-        normal_pay = profile.monthly_salary
+        # 应发月薪按实际在职工作日比例折算，未上班 / 请假不白拿工资
+        normal_pay = profile.monthly_salary * work_days / contract_work_days
         if profile.absence_deduction:
-            absence_deduction = profile.monthly_salary / work_days * absence_days
+            absence_deduction = (
+                profile.monthly_salary / contract_work_days * absence_days
+            )
     fine_amount = max(0.0, float(fine_total or 0.0))
+    deduction_items = [
+        {
+            "id": int(item.get("id") or 0),
+            "name": str(item.get("name") or "其他"),
+            "amount": round(max(0.0, float(item.get("amount") or 0)), 2),
+            "repeat_monthly": bool(item.get("repeat_monthly", True)),
+            "month": str(item.get("month") or ""),
+        }
+        for item in (deductions or [])
+    ]
+    deduction_total = round(
+        sum(item["amount"] for item in deduction_items), 2
+    )
     gross_pay = normal_pay + overtime_pay - absence_deduction
-    total_pay = gross_pay - fine_amount
+    pay_before_deductions = gross_pay - fine_amount
+    total_pay = pay_before_deductions - deduction_total
 
-    # 全月预测：按计划完成 + 当前已产生的加班溢价（罚款已经落定，也要扣掉）
+    # 全月预测：按当前在职 / 请假口径算应得，加上加班溢价（罚款和扣款已落定）
     if monthly_mode:
-        projected_pay = profile.monthly_salary + overtime_total / 60 * rate * (
+        projected_pay = normal_pay + overtime_total / 60 * rate * (
             overtime_rate - 1
         )
     else:
@@ -526,15 +568,20 @@ def summarize(
     if profile.absence_deduction and not month_complete:
         projected_pay -= absence_deduction
     projected_pay -= fine_amount
+    projected_pay -= deduction_total
 
     return {
         "work_days": work_days,
         "rest_days": rest_days,
+        "leave_days": leave_days,
+        "prejob_days": prejob_days,
+        "contract_work_days": contract_work_days,
         "attended_days": attended_days,
         "work_attended_days": work_attended_days,
         "absence_days": absence_days,
         "overtime_rest_days": overtime_rest_days,
         "planned_minutes": planned_total,
+        "contract_planned_minutes": contract_planned_total,
         "planned_elapsed_minutes": planned_elapsed,
         "actual_minutes": actual_total,
         "normal_minutes": normal_total,
@@ -556,11 +603,17 @@ def summarize(
         "overtime_pay": round(overtime_pay, 2),
         "absence_deduction": round(absence_deduction, 2),
         "fine_total": round(fine_amount, 2),
+        "deduction_items": deduction_items,
+        "deduction_total": deduction_total,
+        "pay_before_deductions": round(pay_before_deductions, 2),
         "gross_pay": round(gross_pay, 2),
         "total_pay": round(total_pay, 2),
+        "net_pay": round(total_pay, 2),
         "projected_pay": round(projected_pay, 2),
+        "standard_hours": round(profile.standard_hours, 1),
+        "standard_minutes": standard_minutes,
         "daily_pay": round(
-            profile.monthly_salary / work_days
+            profile.monthly_salary / contract_work_days
             if monthly_mode
             else profile.daily_minutes / 60 * rate,
             2,

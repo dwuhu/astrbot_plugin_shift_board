@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS profiles (
     remind_enabled       INTEGER NOT NULL DEFAULT 1,
     remind_before_start  INTEGER NOT NULL DEFAULT 30,
     remind_before_end    INTEGER NOT NULL DEFAULT 15,
+    remind_in_text       TEXT NOT NULL DEFAULT '',
+    remind_out_text      TEXT NOT NULL DEFAULT '',
+    weather_city         TEXT NOT NULL DEFAULT '',
+    weather_enabled      INTEGER NOT NULL DEFAULT 1,
+    standard_hours       REAL NOT NULL DEFAULT 8.0,
+    overtime_alert_enabled INTEGER NOT NULL DEFAULT 1,
+    rest_reminder_enabled INTEGER NOT NULL DEFAULT 1,
     created_at           TEXT NOT NULL DEFAULT '',
     updated_at           TEXT NOT NULL DEFAULT ''
 );
@@ -97,6 +104,19 @@ CREATE TABLE IF NOT EXISTS month_rests (
     updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (user_key, month)
 );
+
+CREATE TABLE IF NOT EXISTS deductions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_key       TEXT NOT NULL,
+    name           TEXT NOT NULL DEFAULT '',
+    amount         REAL NOT NULL DEFAULT 0,
+    month          TEXT NOT NULL DEFAULT '',
+    repeat_monthly INTEGER NOT NULL DEFAULT 1,
+    note           TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_deductions_user_month ON deductions(user_key, month);
 """
 
 # 老版本数据库补齐新增列（升级时不丢数据）
@@ -107,6 +127,13 @@ _PROFILE_EXTRA_COLUMNS = {
     "remind_before_end": "INTEGER NOT NULL DEFAULT 15",
     "monthly_salary": "REAL NOT NULL DEFAULT 0",
     "pay_mode": "TEXT NOT NULL DEFAULT 'hourly'",
+    "remind_in_text": "TEXT NOT NULL DEFAULT ''",
+    "remind_out_text": "TEXT NOT NULL DEFAULT ''",
+    "weather_city": "TEXT NOT NULL DEFAULT ''",
+    "weather_enabled": "INTEGER NOT NULL DEFAULT 1",
+    "standard_hours": "REAL NOT NULL DEFAULT 8.0",
+    "overtime_alert_enabled": "INTEGER NOT NULL DEFAULT 1",
+    "rest_reminder_enabled": "INTEGER NOT NULL DEFAULT 1",
 }
 
 _ALLOWED_FIELDS = {
@@ -126,6 +153,13 @@ _ALLOWED_FIELDS = {
     "remind_enabled",
     "remind_before_start",
     "remind_before_end",
+    "remind_in_text",
+    "remind_out_text",
+    "weather_city",
+    "weather_enabled",
+    "standard_hours",
+    "overtime_alert_enabled",
+    "rest_reminder_enabled",
 }
 
 
@@ -142,6 +176,13 @@ class UserRecord:
     remind_enabled: bool = True
     remind_before_start: int = 30
     remind_before_end: int = 15
+    remind_in_text: str = ""
+    remind_out_text: str = ""
+    weather_city: str = ""
+    weather_enabled: bool = True
+    standard_hours: float = 8.0
+    overtime_alert_enabled: bool = True
+    rest_reminder_enabled: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -165,6 +206,13 @@ class UserRecord:
             "remind_enabled": self.remind_enabled,
             "remind_before_start": self.remind_before_start,
             "remind_before_end": self.remind_before_end,
+            "remind_in_text": self.remind_in_text,
+            "remind_out_text": self.remind_out_text,
+            "weather_city": self.weather_city,
+            "weather_enabled": self.weather_enabled,
+            "standard_hours": self.standard_hours,
+            "overtime_alert_enabled": self.overtime_alert_enabled,
+            "rest_reminder_enabled": self.rest_reminder_enabled,
             "updated_at": self.updated_at,
         }
 
@@ -214,6 +262,8 @@ class ShiftStore:
         defaults: Profile | None = None,
         umo: str = "",
         remind_defaults: dict | None = None,
+        weather_city: str = "",
+        weather_enabled: bool = True,
     ) -> UserRecord:
         defaults = (defaults or Profile()).normalized()
         remind_defaults = remind_defaults or {}
@@ -235,8 +285,10 @@ class ShiftStore:
                     pay_mode, overtime_rate,
                     absence_deduction, rest_day_as_overtime, umo,
                     remind_enabled, remind_before_start, remind_before_end,
+                    weather_city, weather_enabled,
+                    standard_hours, overtime_alert_enabled,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_key) DO UPDATE SET
                     uid = excluded.uid,
                     platform = excluded.platform,
@@ -264,6 +316,10 @@ class ShiftStore:
                     remind_enabled,
                     remind_before_start,
                     remind_before_end,
+                    weather_city,
+                    int(bool(weather_enabled)),
+                    float(defaults.standard_hours or 8.0),
+                    1,
                     now,
                     now,
                 ),
@@ -323,6 +379,22 @@ class ShiftStore:
             payload["remind_before_end"] = max(
                 0, min(240, int(payload["remind_before_end"]))
             )
+        if "remind_in_text" in payload:
+            payload["remind_in_text"] = str(payload["remind_in_text"] or "").strip()[:500]
+        if "remind_out_text" in payload:
+            payload["remind_out_text"] = str(payload["remind_out_text"] or "").strip()[:500]
+        if "weather_city" in payload:
+            payload["weather_city"] = str(payload["weather_city"] or "").strip()[:40]
+        if "weather_enabled" in payload:
+            payload["weather_enabled"] = int(bool(payload["weather_enabled"]))
+        if "overtime_alert_enabled" in payload:
+            payload["overtime_alert_enabled"] = int(bool(payload["overtime_alert_enabled"]))
+        if "rest_reminder_enabled" in payload:
+            payload["rest_reminder_enabled"] = int(bool(payload["rest_reminder_enabled"]))
+        if "standard_hours" in payload:
+            payload["standard_hours"] = max(
+                1.0, min(24.0, float(payload["standard_hours"] or 8.0))
+            )
 
         payload["updated_at"] = _now()
         assignments = ", ".join(f"{key} = ?" for key in payload)
@@ -348,6 +420,7 @@ class ShiftStore:
             monthly_salary=float(row["monthly_salary"] or 0),
             pay_mode=row["pay_mode"] or "hourly",
             overtime_rate=float(row["overtime_rate"] or 1.5),
+            standard_hours=float(row["standard_hours"] or 8.0),
             absence_deduction=bool(row["absence_deduction"]),
             rest_day_as_overtime=bool(row["rest_day_as_overtime"]),
         )
@@ -363,6 +436,13 @@ class ShiftStore:
             remind_enabled=bool(row["remind_enabled"]),
             remind_before_start=int(row["remind_before_start"] or 0),
             remind_before_end=int(row["remind_before_end"] or 0),
+            remind_in_text=row["remind_in_text"] or "",
+            remind_out_text=row["remind_out_text"] or "",
+            weather_city=row["weather_city"] or "",
+            weather_enabled=bool(row["weather_enabled"]),
+            standard_hours=float(row["standard_hours"] or 8.0),
+            overtime_alert_enabled=bool(row["overtime_alert_enabled"]),
+            rest_reminder_enabled=bool(row["rest_reminder_enabled"]),
         )
 
     # ------------------------------------------------------------------ #
@@ -665,6 +745,67 @@ class ShiftStore:
             await conn.close()
 
     # ------------------------------------------------------------------ #
+    # 未上班 / 请假（复用 schedules.kind='leave'，保留原班次时长）
+    # ------------------------------------------------------------------ #
+    async def set_leave_days(
+        self, user_key: str, month: str, days: list[int]
+    ) -> int:
+        """把本月指定工作日标成未上班/请假；休息日不处理，返回实际标记天数。"""
+        if not days:
+            return 0
+        placeholders = ",".join("?" for _ in days)
+        conn = await self._connect()
+        try:
+            cursor = await conn.execute(
+                f"UPDATE schedules SET kind = 'leave'"
+                f" WHERE user_key = ? AND month = ? AND day IN ({placeholders})"
+                f" AND kind = 'work'",
+                (user_key, month, *[f"{month}-{int(day):02d}" for day in days]),
+            )
+            await conn.commit()
+            return int(cursor.rowcount or 0)
+        finally:
+            await conn.close()
+
+    async def clear_leave_days(
+        self, user_key: str, month: str, days: list[int] | None = None
+    ) -> int:
+        """恢复未上班/请假为正常工作日；days 为空则恢复整月。"""
+        conn = await self._connect()
+        try:
+            if days:
+                placeholders = ",".join("?" for _ in days)
+                cursor = await conn.execute(
+                    f"UPDATE schedules SET kind = 'work'"
+                    f" WHERE user_key = ? AND month = ? AND kind = 'leave'"
+                    f" AND day IN ({placeholders})",
+                    (user_key, month, *[f"{month}-{int(day):02d}" for day in days]),
+                )
+            else:
+                cursor = await conn.execute(
+                    "UPDATE schedules SET kind = 'work'"
+                    " WHERE user_key = ? AND month = ? AND kind = 'leave'",
+                    (user_key, month),
+                )
+            await conn.commit()
+            return int(cursor.rowcount or 0)
+        finally:
+            await conn.close()
+
+    async def get_leave_days(self, user_key: str, month: str) -> list[int]:
+        conn = await self._connect()
+        try:
+            cursor = await conn.execute(
+                "SELECT day FROM schedules"
+                " WHERE user_key = ? AND month = ? AND kind = 'leave' ORDER BY day",
+                (user_key, month),
+            )
+            rows = await cursor.fetchall()
+        finally:
+            await conn.close()
+        return [int(str(row["day"])[-2:]) for row in rows]
+
+    # ------------------------------------------------------------------ #
     # 罚款（按人 + 按月累计，直接从实发工资里扣）
     # ------------------------------------------------------------------ #
     async def add_fine(
@@ -747,6 +888,166 @@ class ShiftStore:
             await conn.close()
 
     # ------------------------------------------------------------------ #
+    # 每月固定扣款（标签自定义：社保、水电、餐费、房租…）
+    # ------------------------------------------------------------------ #
+    async def add_deduction(
+        self,
+        user_key: str,
+        name: str,
+        amount: float,
+        month: str,
+        *,
+        repeat_monthly: bool = True,
+        note: str = "",
+    ) -> dict:
+        name = str(name or "").strip()[:20]
+        if not name:
+            raise ValueError("扣款标签不能为空")
+        amount = max(0.0, round(float(amount), 2))
+        month = str(month or "")[:7]
+        repeat = int(bool(repeat_monthly))
+        conn = await self._connect()
+        try:
+            # 同一个标签重复添加时直接改金额，避免 AI 反复说“房租1500”堆成一串
+            cursor = await conn.execute(
+                "SELECT id FROM deductions WHERE user_key = ? AND name = ?"
+                " AND repeat_monthly = ?"
+                + (" AND month <= ?" if repeat else " AND month = ?")
+                + " ORDER BY id DESC LIMIT 1",
+                (user_key, name, repeat, month),
+            )
+            row = await cursor.fetchone()
+            if row:
+                await conn.execute(
+                    "UPDATE deductions SET amount = ?, note = ? WHERE id = ?",
+                    (amount, str(note or "")[:80], row["id"]),
+                )
+                deduction_id = int(row["id"])
+            else:
+                cursor = await conn.execute(
+                    "INSERT INTO deductions"
+                    " (user_key, name, amount, month, repeat_monthly, note, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        user_key,
+                        name,
+                        amount,
+                        month,
+                        repeat,
+                        str(note or "")[:80],
+                        _now(),
+                    ),
+                )
+                deduction_id = int(cursor.lastrowid or 0)
+            await conn.commit()
+        finally:
+            await conn.close()
+        return {
+            "id": deduction_id,
+            "name": name,
+            "amount": amount,
+            "month": month,
+            "repeat_monthly": bool(repeat),
+        }
+
+    async def list_deductions(self, user_key: str, month: str) -> list[dict]:
+        """列出某个月生效的扣款：固定项从起始月起一直生效，单次项只落在指定月。"""
+        conn = await self._connect()
+        try:
+            cursor = await conn.execute(
+                "SELECT id, name, amount, month, repeat_monthly, note, created_at"
+                " FROM deductions WHERE user_key = ?"
+                " AND ((repeat_monthly = 1 AND month <= ?) OR (repeat_monthly = 0 AND month = ?))"
+                " ORDER BY id",
+                (user_key, month, month),
+            )
+            rows = await cursor.fetchall()
+        finally:
+            await conn.close()
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "amount": round(float(row["amount"] or 0), 2),
+                "month": row["month"],
+                "repeat_monthly": bool(row["repeat_monthly"]),
+                "note": row["note"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    async def deduction_total(self, user_key: str, month: str) -> float:
+        return round(
+            sum(item["amount"] for item in await self.list_deductions(user_key, month)), 2
+        )
+
+    async def update_deduction(
+        self,
+        user_key: str,
+        deduction_id: int,
+        *,
+        name: str,
+        amount: float,
+        repeat_monthly: bool,
+        month: str,
+        note: str = "",
+    ) -> dict | None:
+        name = str(name or "").strip()[:20]
+        if not name:
+            raise ValueError("扣款标签不能为空")
+        conn = await self._connect()
+        try:
+            cursor = await conn.execute(
+                "UPDATE deductions SET name = ?, amount = ?, month = ?,"
+                " repeat_monthly = ?, note = ?"
+                " WHERE user_key = ? AND id = ?",
+                (
+                    name,
+                    round(max(0.0, float(amount)), 2),
+                    str(month or "")[:7],
+                    int(bool(repeat_monthly)),
+                    str(note or "")[:80],
+                    user_key,
+                    int(deduction_id),
+                ),
+            )
+            await conn.commit()
+            if not cursor.rowcount:
+                return None
+            return {
+                "id": int(deduction_id),
+                "name": name,
+                "amount": round(max(0.0, float(amount)), 2),
+                "month": str(month or "")[:7],
+                "repeat_monthly": bool(repeat_monthly),
+            }
+        finally:
+            await conn.close()
+
+    async def delete_deduction(self, user_key: str, deduction_id: int) -> bool:
+        conn = await self._connect()
+        try:
+            cursor = await conn.execute(
+                "DELETE FROM deductions WHERE user_key = ? AND id = ?",
+                (user_key, int(deduction_id)),
+            )
+            await conn.commit()
+            return bool(cursor.rowcount)
+        finally:
+            await conn.close()
+
+    async def find_deduction_by_name(
+        self, user_key: str, name: str, month: str
+    ) -> dict | None:
+        items = await self.list_deductions(user_key, month)
+        target = str(name or "").strip()
+        for item in reversed(items):
+            if item["name"] == target:
+                return item
+        return None
+
+    # ------------------------------------------------------------------ #
     # 整库备份 / 导入
     # ------------------------------------------------------------------ #
     async def export_all(self) -> dict:
@@ -800,7 +1101,7 @@ class ShiftStore:
                     row = {key: raw[key] for key in columns if key in raw}
                     if not row:
                         continue
-                    if table in {"punches", "fines"}:
+                    if table in {"punches", "fines", "deductions"}:
                         row.pop("id", None)
                         if not replace and await _row_exists(conn, table, row):
                             continue
@@ -829,14 +1130,27 @@ _DUMP_TABLES = (
     "fines",
     "month_rests",
     "settings",
+    "deductions",
 )
 
 _PUNCH_DEDUPE_COLUMNS = ("user_key", "day", "start", "end", "minutes")
 _FINE_DEDUPE_COLUMNS = ("user_key", "month", "amount", "reason")
+_DEDUCTION_DEDUPE_COLUMNS = (
+    "user_key",
+    "name",
+    "amount",
+    "month",
+    "repeat_monthly",
+)
 
 
 async def _row_exists(conn: aiosqlite.Connection, table: str, row: dict) -> bool:
-    columns = _PUNCH_DEDUPE_COLUMNS if table == "punches" else _FINE_DEDUPE_COLUMNS
+    if table == "punches":
+        columns = _PUNCH_DEDUPE_COLUMNS
+    elif table == "fines":
+        columns = _FINE_DEDUPE_COLUMNS
+    else:
+        columns = _DEDUCTION_DEDUPE_COLUMNS
     if any(column not in row for column in columns):
         return False
     where = " AND ".join(f"{column} = ?" for column in columns)
