@@ -37,6 +37,7 @@ class Profile:
     standard_hours: float = 8.0
     absence_deduction: bool = False
     rest_day_as_overtime: bool = True
+    employment_stage: str = "regular"  # intern / regular
 
     def normalized(self) -> "Profile":
         """把非法值收敛到可用范围，避免用户输入把统计算崩。"""
@@ -51,6 +52,9 @@ class Profile:
             pay_mode = "hourly"
         overtime = max(1.0, float(self.overtime_rate or 1.0))
         standard_hours = max(1.0, min(float(self.standard_hours or 8.0), 24.0))
+        stage = str(self.employment_stage or "regular").strip().lower()
+        if stage not in {"intern", "regular"}:
+            stage = "regular"
         return Profile(
             rest_mode=rest_mode,
             shift_start=normalize_hhmm(self.shift_start, "09:00"),
@@ -64,6 +68,7 @@ class Profile:
             standard_hours=standard_hours,
             absence_deduction=bool(self.absence_deduction),
             rest_day_as_overtime=bool(self.rest_day_as_overtime),
+            employment_stage=stage,
         )
 
     @property
@@ -119,6 +124,7 @@ class DayStats:
     is_today: bool
     is_future: bool
     punches: list[Punch] = field(default_factory=list)
+    live_minutes: int = 0
 
     @property
     def status(self) -> str:
@@ -209,6 +215,14 @@ def parse_month(value: object, fallback: date | None = None) -> str:
     text = str(value or "").strip()
     if not text:
         return f"{fallback.year:04d}-{fallback.month:02d}"
+    if text in {"本月", "这个月", "当月", "current"}:
+        return f"{fallback.year:04d}-{fallback.month:02d}"
+    if text in {"下个月", "下月", "next"}:
+        index = fallback.year * 12 + fallback.month
+        return f"{index // 12:04d}-{index % 12 + 1:02d}"
+    if text in {"上个月", "上月", "prev", "last"}:
+        index = fallback.year * 12 + fallback.month - 2
+        return f"{index // 12:04d}-{index % 12 + 1:02d}"
     match = _MONTH_RE.match(text)
     if match:
         year, month = int(match.group(1)), int(match.group(2))
@@ -216,6 +230,11 @@ def parse_month(value: object, fallback: date | None = None) -> str:
             return f"{year:04d}-{month:02d}"
     if re.match(r"^\d{1,2}$", text):
         month = int(text)
+        if 1 <= month <= 12:
+            return f"{fallback.year:04d}-{month:02d}"
+    month_only = re.match(r"^(\d{1,2})\s*月$", text)
+    if month_only:
+        month = int(month_only.group(1))
         if 1 <= month <= 12:
             return f"{fallback.year:04d}-{month:02d}"
     if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
@@ -341,6 +360,33 @@ def shift_type_label(profile: Profile) -> str:
     return "夜班（跨天）" if end <= start else "白班"
 
 
+def stage_label(stage: str) -> str:
+    return "实习" if str(stage or "").lower() == "intern" else "正式"
+
+
+def _open_punch_minutes(punch: Punch, now: datetime) -> int:
+    """进行中的打卡从开始时间算到现在；跨天夜班自动按前一天处理。"""
+    try:
+        started = datetime.fromisoformat(f"{punch.day}T{punch.start}")
+    except ValueError:
+        return 0
+    if started > now:
+        started -= timedelta(days=1)
+    return max(0, min(24 * 60, int((now - started).total_seconds() // 60)))
+
+
+def _shift_window(day: str, start: str, end: str) -> tuple[datetime, datetime] | None:
+    """返回某天班次的开始 / 结束时间；夜班结束自动进到次日。"""
+    try:
+        start_dt = datetime.fromisoformat(f"{day}T{start}")
+        end_dt = datetime.fromisoformat(f"{day}T{end}")
+    except ValueError:
+        return None
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+    return start_dt, end_dt
+
+
 def build_month_schedule(
     year: int,
     month: int,
@@ -412,6 +458,7 @@ def summarize(
     profile: Profile,
     *,
     today: date | None = None,
+    now: datetime | None = None,
     month_complete: bool = False,
     fine_total: float = 0.0,
     deductions: list[dict] | None = None,
@@ -427,6 +474,7 @@ def summarize(
     """
     profile = profile.normalized()
     today = today or date.today()
+    now = now or datetime.now()
     standard_minutes = int(round(profile.standard_hours * 60))
     grouped: dict[str, list[Punch]] = {}
     for punch in punches:
@@ -442,6 +490,7 @@ def summarize(
         is_future = current > today
         day_punches = grouped.get(slot.day, [])
         actual = sum(max(0, int(p.minutes or 0)) for p in day_punches if not p.is_open)
+        live = sum(_open_punch_minutes(p, now) for p in day_punches if p.is_open)
         # 未上班 / 请假仍然保留原班次信息，方便展示和恢复；只是不计入有效工作日
         effective_kind = slot.kind
         if effective_kind == "work" and first_punch_day and slot.day < first_punch_day:
@@ -489,6 +538,7 @@ def summarize(
                 is_today=is_today,
                 is_future=is_future,
                 punches=day_punches,
+                live_minutes=live,
             )
         )
 
@@ -516,6 +566,33 @@ def summarize(
     normal_total = sum(s.normal_minutes for s in day_stats)
     overtime_total = sum(s.overtime_minutes for s in day_stats)
     absence_minutes = sum(s.planned_minutes for s in day_stats if s.absent)
+    today_stats = [s for s in day_stats if s.is_today]
+    today_minutes = sum(s.actual_minutes + s.live_minutes for s in today_stats)
+    today_open_start = next(
+        (p.start for s in today_stats for p in s.punches if p.is_open), ""
+    )
+    today_open_minutes = sum(s.live_minutes for s in today_stats)
+    # 上班过程中还剩多久下班：按当前查看/正在计时的那个工作日班次结束时间算；
+    # 夜班结束时间在次日，跨午夜时也能继续倒计时。
+    today_remaining_minutes = 0
+    today_end_label = ""
+    open_punch = next((p for p in punches if p.is_open), None)
+    active_shift = next((s for s in today_stats if s.kind == "work"), None)
+    if open_punch:
+        active_shift = next(
+            (s for s in day_stats if s.day == open_punch.day and s.kind == "work"),
+            active_shift if active_shift and active_shift.day == open_punch.day else None,
+        )
+    if active_shift:
+        window = _shift_window(active_shift.day, active_shift.start, active_shift.end)
+        if window:
+            shift_start, shift_end = window
+            has_open = bool(open_punch and open_punch.day == active_shift.day)
+            if now <= shift_end and (now >= shift_start or has_open):
+                today_remaining_minutes = max(
+                    0, int((shift_end - now).total_seconds() // 60)
+                )
+                today_end_label = shift_end.strftime("%H:%M")
 
     rate = profile.hourly_rate
     overtime_rate = profile.overtime_rate
@@ -528,6 +605,7 @@ def summarize(
     if monthly_mode:
         # 月薪制：按全月合同工作日折算时薪；未上班和请假的天数不计薪
         rate = profile.monthly_salary / (contract_planned_total / 60)
+    monthly_daily = profile.monthly_salary / contract_work_days if monthly_mode else 0.0
     normal_pay = normal_total / 60 * rate
     overtime_pay = overtime_total / 60 * rate * overtime_rate
     absence_deduction = (absence_minutes / 60 * rate) if profile.absence_deduction else 0.0
@@ -538,6 +616,24 @@ def summarize(
             absence_deduction = (
                 profile.monthly_salary / contract_work_days * absence_days
             )
+
+    # 「今年实际收入」不是按全月预测，而是按已经发生的打卡逐天累计：
+    # 月薪按每个实际出勤日加一天日薪，时薪按实际工时加钱；进行中的打卡也实时计入。
+    earned_pay = 0.0
+    paid_days = 0
+    for day in day_stats:
+        live_actual = day.actual_minutes + day.live_minutes
+        if day.kind == "work" and live_actual > 0:
+            paid_days += 1
+            base_minutes = min(day.planned_minutes, standard_minutes)
+            over_minutes = max(0, live_actual - base_minutes)
+            if monthly_mode:
+                earned_pay += monthly_daily
+            else:
+                earned_pay += min(live_actual, base_minutes) / 60 * rate
+            earned_pay += over_minutes / 60 * rate * overtime_rate
+        elif day.kind == "rest" and live_actual > 0 and profile.rest_day_as_overtime:
+            earned_pay += live_actual / 60 * rate * overtime_rate
     fine_amount = max(0.0, float(fine_total or 0.0))
     deduction_items = [
         {
@@ -609,6 +705,17 @@ def summarize(
         "gross_pay": round(gross_pay, 2),
         "total_pay": round(total_pay, 2),
         "net_pay": round(total_pay, 2),
+        "earned_pay": round(earned_pay, 2),
+        "earned_net": round(earned_pay - fine_amount - deduction_total, 2),
+        "paid_days": paid_days,
+        "stage": profile.employment_stage,
+        "stage_label": stage_label(profile.employment_stage),
+        "today_minutes": today_minutes,
+        "today_open_start": today_open_start,
+        "today_open_minutes": today_open_minutes,
+        "today_remaining_minutes": today_remaining_minutes,
+        "today_end_label": today_end_label,
+        "now_label": now.strftime("%H:%M"),
         "projected_pay": round(projected_pay, 2),
         "standard_hours": round(profile.standard_hours, 1),
         "standard_minutes": standard_minutes,

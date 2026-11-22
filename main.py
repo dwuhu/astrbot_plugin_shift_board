@@ -18,13 +18,14 @@ import io
 import json
 import re
 import time
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -42,7 +43,9 @@ from .planner import (
     parse_hhmm,
     parse_month,
     shift_minutes,
+    shift_month,
     shift_type_label,
+    stage_label,
     summarize,
     week_range,
 )
@@ -50,6 +53,17 @@ from .store import ShiftStore, UserRecord
 
 PLUGIN_NAME = "astrbot_plugin_shift_board"
 _REST_MODES = (4, 6, 8)
+
+# 文转图清晰度：AstrBot 默认 quality=40 的 JPEG，缩到聊天窗口里字会糊。
+# 这里统一拉到 100，考勤图再按 760 视口用 1.8 倍设备像素输出。
+_T2I_OPTIONS = {"quality": 100, "type": "png"}
+_T2I_ATTENDANCE_OPTIONS = {
+    "quality": 100,
+    "type": "png",
+    "scale": "device",
+    "device_scale_factor_level": "ultra",
+    "viewport_width": 760,
+}
 _PREFIX_RE = re.compile(r"^[\s/!#！。，,]+")
 
 
@@ -313,6 +327,37 @@ def _number(token: object) -> float | None:
     return float(match.group()) if match else None
 
 
+def _is_month_token(token: object) -> bool:
+    text = str(token or "").strip()
+    if text in {"本月", "这个月", "当月"}:
+        return True
+    if re.fullmatch(r"\d{4}[-/.]\d{1,2}", text):
+        return True
+    return bool(re.search(r"\d", text) and ("月" in text or "年" in text))
+
+
+def _salary_month(tokens: list[str], default: str = "") -> str:
+    """从参数里找月份；没写就落到本月。"""
+    for token in reversed(tokens):
+        text = str(token or "").strip()
+        if text in {"本月", "这个月", "当月"}:
+            return f"{date.today():%Y-%m}"
+        if re.fullmatch(r"\d{4}[-/.]\d{1,2}", text):
+            return parse_month(text)
+        if re.search(r"\d", text) and ("月" in text or "年" in text):
+            return parse_month(text)
+    return parse_month(default)
+
+
+def _parse_stage(token: object) -> str | None:
+    text = str(token or "").strip().lower()
+    if text in {"实习", "实习期", "intern", "internship"}:
+        return "intern"
+    if text in {"正式", "转正", "regular", "fulltime", "full-time"}:
+        return "regular"
+    return None
+
+
 def _day_dict(day) -> dict:
     return {
         "day": day.day,
@@ -322,6 +367,7 @@ def _day_dict(day) -> dict:
         "end": day.end,
         "planned_minutes": day.planned_minutes,
         "actual_minutes": day.actual_minutes,
+        "live_minutes": day.live_minutes,
         "normal_minutes": day.normal_minutes,
         "overtime_minutes": day.overtime_minutes,
         "status": day.status,
@@ -343,8 +389,76 @@ def _day_dict(day) -> dict:
     }
 
 
+def _profile_with_salary(profile: Profile, record: dict | None) -> Profile:
+    """用某个月的工资档案覆盖档案里的工资字段，其他设置不动。"""
+    if not record:
+        return profile
+    mode = "monthly" if str(record.get("pay_mode") or "").lower() == "monthly" else "hourly"
+    return replace(
+        profile,
+        pay_mode=mode,
+        monthly_salary=max(0.0, float(record.get("monthly_salary") or 0)),
+        hourly_rate=max(0.0, float(record.get("hourly_rate") or 0)),
+        employment_stage="intern"
+        if str(record.get("stage") or "").lower() == "intern"
+        else "regular",
+    )
+
+
 def _summary_dict(summary: dict) -> dict:
     return {key: value for key, value in summary.items() if key != "days"}
+
+
+def _profile_from_summary(profile: Profile, summary: dict) -> Profile:
+    return replace(
+        profile,
+        pay_mode=summary.get("pay_mode", profile.pay_mode),
+        monthly_salary=float(summary.get("monthly_salary", profile.monthly_salary) or 0),
+        hourly_rate=float(summary.get("hourly_rate", profile.hourly_rate) or 0),
+        employment_stage=summary.get("stage", profile.employment_stage),
+    )
+
+
+def _payday_date(salary_month: str, mode: str, day: int) -> date:
+    """工资月 -> 实际发薪日。
+
+    month_end：当月最后一天发当月工资；
+    next_month：压一个月，次月 day 号发。
+    """
+    _, month_last = month_bounds(salary_month)
+    if mode != "next_month":
+        return month_last
+    _, next_last = month_bounds(shift_month(salary_month, 1))
+    target_day = max(1, min(31, int(day or 15)))
+    return date(next_last.year, next_last.month, min(target_day, next_last.day))
+
+
+def _payday_rule_label(mode: str, day: int) -> str:
+    if mode == "next_month":
+        return f"压一月 · 次月{max(1, min(31, int(day or 15)))}号发"
+    return "当月月底发"
+
+
+def _realtime_net_pay(summary: dict) -> float:
+    """当前月按已出勤天数实时累计的到手工资。
+
+    月薪制：本月应得 ÷ 本月应出勤天数 × 已出勤天数，上一天算一天；
+    这样不会月初就显示整月工资，也不会把整月固定扣款一次扣完。
+    时薪制：按实际工时累计，再扣罚款；固定扣款按出勤进度分摊。
+    """
+    total_pay = max(0.0, float(summary.get("total_pay", 0.0) or 0.0))
+    work_days = max(0, int(summary.get("work_days", 0) or 0))
+    attended = max(0, int(summary.get("work_attended_days", 0) or 0))
+    if str(summary.get("pay_mode") or "") == "monthly" and work_days > 0:
+        progress = min(1.0, attended / work_days)
+        return round(total_pay * progress, 2)
+    earned = max(0.0, float(summary.get("earned_pay", 0.0) or 0.0))
+    fine = max(0.0, float(summary.get("fine_total", 0.0) or 0.0))
+    deduction = max(0.0, float(summary.get("deduction_total", 0.0) or 0.0))
+    contract_days = max(0, int(summary.get("contract_work_days", 0) or 0))
+    paid_days = max(0, int(summary.get("paid_days", 0) or 0))
+    progress = min(1.0, paid_days / contract_days) if contract_days else 1.0
+    return round(max(0.0, earned - fine - deduction * progress), 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -380,6 +494,9 @@ class ShiftBoardPlugin(Star):
             ("data/export", self.api_data_export, ["GET"], "导出整库备份 JSON"),
             ("data/import", self.api_data_import, ["POST"], "导入整库备份"),
             ("punches/import", self.api_punches_import, ["POST"], "导入打卡 CSV"),
+            ("payroll/save", self.api_payroll_save, ["POST"], "保存发薪规则与提醒"),
+            ("payroll/pay", self.api_payroll_pay, ["POST"], "登记某月工资到账"),
+            ("payroll/unpay", self.api_payroll_unpay, ["POST"], "撤销到账登记"),
         )
         for path, handler, methods, desc in routes:
             self.context.register_web_api(
@@ -464,10 +581,93 @@ class ShiftBoardPlugin(Star):
         await self.store.save_schedule(user_key, month, slots)
         return slots
 
+    async def _profile_for_month(
+        self, user_key: str, month: str, profile: Profile
+    ) -> Profile:
+        record = await self.store.get_salary_record(user_key, month)
+        return _profile_with_salary(profile, record)
+
+    async def _save_month_salary(
+        self,
+        user_key: str,
+        month: str,
+        *,
+        monthly_salary: float | None = None,
+        hourly_rate: float | None = None,
+        pay_mode: str | None = None,
+        employment_stage: str | None = None,
+        note: str = "",
+    ) -> UserRecord | None:
+        """只改指定月份的工资；改之前先把其他月份按旧口径存档。
+
+        这样 10 月 3000、11 月 5000 可以同时存在，之后涨薪不会回头改写历史月份。
+        """
+        user = await self.store.get_user(user_key)
+        if user is None:
+            return None
+        existing = await self.store.get_salary_record(user_key, month)
+        base = existing or {
+            "monthly_salary": user.profile.monthly_salary,
+            "hourly_rate": user.profile.hourly_rate,
+            "pay_mode": user.profile.pay_mode,
+            "stage": user.profile.employment_stage,
+        }
+        old_monthly = float(base.get("monthly_salary") or 0)
+        old_hourly = float(base.get("hourly_rate") or 0)
+        old_mode = str(base.get("pay_mode") or "hourly")
+        old_stage = str(base.get("stage") or "regular")
+
+        new_monthly = old_monthly if monthly_salary is None else max(0.0, float(monthly_salary))
+        new_hourly = old_hourly if hourly_rate is None else max(0.0, float(hourly_rate))
+        new_mode = str(pay_mode or "").lower() if pay_mode else old_mode
+        if new_mode not in {"hourly", "monthly"}:
+            new_mode = old_mode
+        if monthly_salary is not None and pay_mode is None and new_monthly > 0:
+            new_mode = "monthly"
+        if hourly_rate is not None and pay_mode is None and new_hourly > 0:
+            new_mode = "hourly"
+        new_stage = "intern" if str(employment_stage or old_stage).lower() == "intern" else "regular"
+
+        active_months = await self.store.list_active_months(user_key)
+        for other in active_months:
+            if other == month:
+                continue
+            if await self.store.get_salary_record(user_key, other) is None:
+                await self.store.save_salary_record(
+                    user_key,
+                    other,
+                    pay_mode=old_mode,
+                    monthly_salary=old_monthly,
+                    hourly_rate=old_hourly,
+                    stage=old_stage,
+                    note="历史月份自动存档",
+                )
+        await self.store.save_salary_record(
+            user_key,
+            month,
+            pay_mode=new_mode,
+            monthly_salary=new_monthly,
+            hourly_rate=new_hourly,
+            stage=new_stage,
+            note=note,
+        )
+
+        current = f"{date.today():%Y-%m}"
+        if month == current:
+            await self.store.update_profile(
+                user_key,
+                pay_mode=new_mode,
+                monthly_salary=new_monthly,
+                hourly_rate=new_hourly,
+                employment_stage=new_stage,
+            )
+        return await self.store.get_user(user_key)
+
     async def _month_stats(
         self, user_key: str, month: str, profile: Profile
     ) -> tuple[list[DaySlot], dict]:
         slots = await self._ensure_month(user_key, month, profile)
+        profile = await self._profile_for_month(user_key, month, profile)
         first, last = month_bounds(month)
         punches = await self.store.list_punches(
             user_key, first.isoformat(), last.isoformat()
@@ -478,6 +678,7 @@ class ShiftBoardPlugin(Star):
             punches,
             profile,
             today=date.today(),
+            now=datetime.now(),
             month_complete=month < current_month,
             fine_total=await self.store.fine_total(user_key, month),
             deductions=await self.store.list_deductions(user_key, month),
@@ -505,6 +706,7 @@ class ShiftBoardPlugin(Star):
     ) -> tuple[list[DaySlot], dict]:
         month = f"{day:%Y-%m}"
         slots = await self._ensure_month(user_key, month, profile)
+        profile = await self._profile_for_month(user_key, month, profile)
         slot = next((item for item in slots if item.day == day.isoformat()), None)
         if slot is None:
             generated = build_month_schedule_for(month, profile)
@@ -526,19 +728,331 @@ class ShiftBoardPlugin(Star):
         )
         if info is None:
             return 0.0, summary
-        if profile.hourly_rate <= 0 and profile.monthly_salary <= 0:
+        if summary["hourly_rate"] <= 0 and summary["monthly_salary"] <= 0:
             return 0.0, summary
         rate = summary["hourly_rate"]
         overtime = info.overtime_minutes / 60 * rate * profile.overtime_rate
         if summary["pay_mode"] == "monthly" and summary["work_days"] > 0:
             base = (
-                profile.monthly_salary / summary["work_days"]
+                summary["daily_pay"]
                 if info.kind == "work" and info.actual_minutes > 0
                 else 0.0
             )
             return base + overtime, summary
         normal = info.normal_minutes / 60 * rate
         return normal + overtime, summary
+
+    async def _annual_income(self, user_key: str, year: str) -> dict:
+        """按实际出勤累计年收入：只算已经发生的打卡，不用全月预测。"""
+        user = await self.store.get_user(user_key)
+        if user is None:
+            return {"year": year, "months": [], "total": 0.0, "net_total": 0.0, "paid_days": 0, "by_stage": {}}
+        current = f"{date.today():%Y-%m}"
+        active = await self.store.list_active_months(user_key, year)
+        months = sorted(m for m in active if m.startswith(f"{year}-") and m <= current)
+        if current.startswith(f"{year}-") and current not in months:
+            months.append(current)
+            months.sort()
+        rows: list[dict] = []
+        by_stage: dict[str, dict] = {
+            "intern": {"label": "实习", "total": 0.0, "net_total": 0.0, "paid_days": 0},
+            "regular": {"label": "正式", "total": 0.0, "net_total": 0.0, "paid_days": 0},
+        }
+        for month in months:
+            _, summary = await self._month_stats(user_key, month, user.profile)
+            stage = summary.get("stage", "regular")
+            row = {
+                "month": month,
+                "month_label": month_label(month),
+                "stage": stage,
+                "stage_label": summary.get("stage_label", stage_label(stage)),
+                "pay_mode": summary.get("pay_mode", "hourly"),
+                "monthly_salary": summary.get("monthly_salary", 0),
+                "hourly_rate": summary.get("hourly_rate", 0),
+                "daily_pay": summary.get("daily_pay", 0),
+                "earned_pay": summary.get("earned_pay", 0),
+                "earned_net": summary.get("earned_net", 0),
+                "paid_days": summary.get("paid_days", 0),
+                "attended_days": summary.get("attended_days", 0),
+                "actual_hours": summary.get("actual_hours", 0),
+                "total_pay": summary.get("total_pay", 0),
+            }
+            rows.append(row)
+            bucket = by_stage.setdefault(
+                stage, {"label": stage_label(stage), "total": 0.0, "net_total": 0.0, "paid_days": 0}
+            )
+            bucket["total"] += row["earned_pay"]
+            bucket["net_total"] += row["earned_net"]
+            bucket["paid_days"] += row["paid_days"]
+        total = round(sum(row["earned_pay"] for row in rows), 2)
+        net_total = round(sum(row["earned_net"] for row in rows), 2)
+        paid_days = sum(row["paid_days"] for row in rows)
+        for bucket in by_stage.values():
+            bucket["total"] = round(bucket["total"], 2)
+            bucket["net_total"] = round(bucket["net_total"], 2)
+        return {
+            "year": year,
+            "months": rows,
+            "total": total,
+            "net_total": net_total,
+            "paid_days": paid_days,
+            "by_stage": by_stage,
+        }
+
+    async def _payroll(
+        self, user_key: str, *, today: date | None = None
+    ) -> dict:
+        """按月工资应付 / 已到账 / 未发，以及下一次发薪日。"""
+        today = today or date.today()
+        current_month = f"{today:%Y-%m}"
+        user = await self.store.get_user(user_key)
+        if user is None:
+            return {
+                "mode": "month_end",
+                "mode_label": "当月月底发",
+                "payday_day": 15,
+                "rule_label": _payday_rule_label("month_end", 15),
+                "remind_enabled": True,
+                "remind_time": "17:00",
+                "entries": [],
+                "unpaid_total": 0.0,
+                "due_unpaid": 0.0,
+                "upcoming_unpaid": 0.0,
+                "paid_total": 0.0,
+                "next": None,
+                "current": None,
+                "previous": None,
+                "calendar": {},
+            }
+        mode = "next_month" if user.payday_mode == "next_month" else "month_end"
+        payday_day = max(1, min(31, int(user.payday_day or 15)))
+        active = await self.store.list_active_months(user_key)
+        months = [m for m in active if m <= current_month]
+        payouts = {
+            str(row.get("salary_month") or ""): row
+            for row in await self.store.list_payouts(user_key)
+        }
+        entries: list[dict] = []
+        for month in months:
+            _, summary = await self._month_stats(user_key, month, user.profile)
+            due = round(max(0.0, float(summary.get("total_pay", 0.0) or 0.0)), 2)
+            payout = payouts.get(month)
+            paid = round(max(0.0, float((payout or {}).get("amount", 0.0) or 0.0)), 2)
+            if due <= 0 and paid <= 0:
+                continue
+            unpaid = round(max(0.0, due - paid), 2)
+            payday = _payday_date(month, mode, payday_day)
+            days_left = (payday - today).days
+            if unpaid <= 0.009:
+                status, status_label = "paid", "已到账"
+            elif paid > 0:
+                status, status_label = "partial", "部分到账"
+            elif payday <= today:
+                status, status_label = "due", "已到发薪日"
+            else:
+                status, status_label = "pending", "待发"
+            entries.append(
+                {
+                    "salary_month": month,
+                    "month_label": month_label(month),
+                    "stage": summary.get("stage", "regular"),
+                    "stage_label": summary.get(
+                        "stage_label", stage_label(summary.get("stage", "regular"))
+                    ),
+                    "pay_mode": summary.get("pay_mode", "hourly"),
+                    "due": due,
+                    "paid": paid,
+                    "unpaid": unpaid,
+                    "payday": payday.isoformat(),
+                    "payday_label": f"{payday.month}月{payday.day}日",
+                    "days_left": days_left,
+                    "status": status,
+                    "status_label": status_label,
+                    "paid_on": (payout or {}).get("paid_on", ""),
+                    "note": (payout or {}).get("note", ""),
+                }
+            )
+        entries.sort(key=lambda item: item["salary_month"])
+        unpaid_entries = [item for item in entries if item["unpaid"] > 0.009]
+        due_entries = [
+            item
+            for item in unpaid_entries
+            if date.fromisoformat(item["payday"]) <= today
+        ]
+        upcoming_entries = [
+            item
+            for item in unpaid_entries
+            if date.fromisoformat(item["payday"]) > today
+        ]
+        next_entry = (
+            sorted(unpaid_entries, key=lambda item: (item["payday"], item["salary_month"]))[0]
+            if unpaid_entries
+            else None
+        )
+        calendar: dict[str, list[dict]] = {}
+        for item in entries:
+            calendar.setdefault(item["payday"], []).append(
+                {
+                    "salary_month": item["salary_month"],
+                    "month_label": item["month_label"],
+                    "due": item["due"],
+                    "unpaid": item["unpaid"],
+                    "status": item["status"],
+                    "status_label": item["status_label"],
+                }
+            )
+        current = next((item for item in entries if item["salary_month"] == current_month), None)
+        previous = None
+        previous_month = shift_month(current_month, -1)
+        previous = next((item for item in entries if item["salary_month"] == previous_month), None)
+        return {
+            "mode": mode,
+            "mode_label": "压一月发" if mode == "next_month" else "当月月底发",
+            "payday_day": payday_day,
+            "rule_label": _payday_rule_label(mode, payday_day),
+            "remind_enabled": bool(user.payday_remind_enabled),
+            "remind_time": user.payday_remind_time or "17:00",
+            "entries": entries,
+            "unpaid_total": round(sum(item["unpaid"] for item in unpaid_entries), 2),
+            "due_unpaid": round(sum(item["unpaid"] for item in due_entries), 2),
+            "upcoming_unpaid": round(sum(item["unpaid"] for item in upcoming_entries), 2),
+            "paid_total": round(sum(item["paid"] for item in entries), 2),
+            "next": next_entry,
+            "current": current,
+            "previous": previous,
+            "calendar": calendar,
+        }
+
+    async def _attendance_data(self, user: UserRecord) -> dict:
+        """今日考勤卡片的数据：今天工时、今日按时薪累计收入、本月/上月工资。"""
+        today = date.today()
+        month = f"{today:%Y-%m}"
+        _, summary = await self._month_stats(user.user_key, month, user.profile)
+        payroll = await self._payroll(user.user_key, today=today)
+        today_stat = next((day for day in summary["days"] if day.is_today), None)
+        open_start = summary.get("today_open_start") or ""
+        today_minutes = int(summary.get("today_minutes") or 0)
+        if open_start:
+            status_label, status_class = "上班中", "live"
+            detail = (
+                f"{open_start} 上班 · 本段 "
+                f"{human_minutes(summary.get('today_open_minutes', 0))}"
+            )
+        elif today_minutes > 0:
+            status_label, status_class = "已下班", "done"
+            if today_stat:
+                detail = f"{today_stat.start}-{today_stat.end} 已下班"
+            else:
+                detail = f"今天累计 {human_minutes(today_minutes)}"
+        elif today_stat is not None and today_stat.kind == "rest":
+            status_label, status_class = "今天休息", "rest"
+            detail = "今天排休" + (
+                f" · 休班加班 {human_minutes(today_stat.actual_minutes)}"
+                if today_stat.actual_minutes
+                else ""
+            )
+        elif today_stat is not None and today_stat.kind == "leave":
+            status_label, status_class = "请假 / 未上班", "rest"
+            detail = "今天请假，不计薪"
+        elif today_stat is not None and today_stat.kind == "work":
+            status_label, status_class = "还没上班", "idle"
+            detail = f"排班 {today_stat.start}-{today_stat.end}"
+        else:
+            status_label, status_class = "还没上班", "idle"
+            detail = "今天还没有打卡"
+        remaining = int(summary.get("today_remaining_minutes") or 0)
+        if remaining > 0:
+            remaining_label = human_minutes(remaining)
+        elif status_class == "live":
+            remaining_label = "已过下班点"
+        else:
+            remaining_label = "—"
+        current = payroll.get("current") or {}
+        previous = payroll.get("previous") or {}
+        next_item = payroll.get("next") or {}
+        prev_month = shift_month(month, -1)
+        current_paid = round(max(0.0, float(current.get("paid", 0) or 0)), 2)
+        month_expected = round(
+            max(0.0, float(current.get("due", summary.get("total_pay", 0)) or 0)), 2
+        )
+        # 本月「实得」按已出勤天数累计，今天正在上班也实时增加；
+        # 上月及更早月份已经上满，沿用固定的整月工资，不再逐日重算。
+        month_earned = _realtime_net_pay(summary)
+        month_unpaid = round(max(0.0, month_earned - current_paid), 2)
+        older_unpaid = round(
+            sum(
+                max(0.0, float(item.get("unpaid", 0) or 0))
+                for item in payroll.get("entries", [])
+                if item.get("salary_month") != month
+            ),
+            2,
+        )
+        unpaid_total = round(older_unpaid + month_unpaid, 2)
+        if next_item.get("salary_month") == month:
+            next_amount = month_unpaid
+        else:
+            next_amount = round(max(0.0, float(next_item.get("unpaid", 0) or 0)), 2)
+        remaining_minutes = max(
+            0,
+            int(summary.get("planned_minutes") or 0)
+            - int(summary.get("actual_minutes") or 0)
+            - int(summary.get("today_open_minutes") or 0),
+        )
+        # 今天这笔按小时实时累计：上了几小时，就加几小时的时薪。
+        hourly_rate = round(max(0.0, float(summary.get("hourly_rate") or 0)), 2)
+        today_hours = round(today_minutes / 60, 2)
+        today_earned = round(today_hours * hourly_rate, 2)
+        prev_paid = round(max(0.0, float(previous.get("paid", 0) or 0)), 2)
+        return {
+            "nickname": user.nickname,
+            "date_label": f"{today.month}月{today.day}日",
+            "now_label": f"现在 {summary.get('now_label', _now_hhmm())}",
+            "today_status": status_label,
+            "status_class": status_class,
+            "today_minutes_label": human_minutes(today_minutes) if today_minutes else "0小时",
+            "today_detail": detail,
+            "today_hourly": f"¥{hourly_rate:,.2f}/小时",
+            "today_hours_value": f"{today_hours:g}h",
+            "today_earned": f"¥{today_earned:,.2f}",
+            "today_pay_formula": (
+                f"¥{hourly_rate:,.2f}/小时 × {today_hours:g}h"
+            ),
+            "today_remaining_label": remaining_label,
+            "month_label": month_label(month),
+            "month_due": f"¥{month_expected:,.2f}",
+            "month_earned": f"¥{month_earned:,.2f}",
+            "month_paid": f"¥{current_paid:,.2f}",
+            "month_unpaid": f"¥{month_unpaid:,.2f}",
+            "month_progress": (
+                f"已出勤 {summary.get('work_attended_days', 0)}/{summary.get('work_days', 0)} 天"
+                " · 上一天算一天"
+            ),
+            "prev_label": f"{int(prev_month[5:7])}月",
+            "prev_due": (
+                f"¥{float(previous.get('due', 0) or 0):,.2f}" if previous else "—"
+            ),
+            "prev_paid": f"¥{prev_paid:,.2f}" if previous else "—",
+            "prev_unpaid": (
+                f"¥{float(previous.get('unpaid', 0) or 0):,.2f}" if previous else "—"
+            ),
+            "unpaid_total": f"¥{unpaid_total:,.2f}",
+            "older_unpaid": f"¥{older_unpaid:,.2f}",
+            "due_unpaid": f"¥{float(payroll.get('due_unpaid', 0) or 0):,.2f}",
+            "upcoming_unpaid": f"¥{float(payroll.get('upcoming_unpaid', 0) or 0):,.2f}",
+            "next_pay_label": (
+                next_item.get("payday_label", "暂无") if next_item else "暂无"
+            ),
+            "next_amount": f"¥{next_amount:,.2f}" if next_item else "¥0.00",
+            "rule_label": payroll.get("rule_label", "当月月底发"),
+            "remaining_work": human_minutes(remaining_minutes),
+            "month_stats": (
+                f"本月出勤 {summary.get('work_attended_days', summary.get('attended_days', 0))}"
+                f"/{summary.get('work_days', 0)} 天 · 实际 "
+                f"{human_minutes(summary.get('actual_minutes', 0))}"
+                f" · 完成率 {float(summary.get('completion', 0) or 0):.1f}%"
+                f" · 还要上 {human_minutes(remaining_minutes)}"
+            ),
+        }
 
     async def _slot_for_day(
         self, user_key: str, day: date, profile: Profile
@@ -610,6 +1124,13 @@ class ShiftBoardPlugin(Star):
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         f"排班工坊：{user.user_key} 的休息日提醒检查失败：{exc}"
+                    )
+            if user.payday_remind_enabled:
+                try:
+                    await self._check_payday_reminder(user, now)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"排班工坊：{user.user_key} 的发薪日提醒检查失败：{exc}"
                     )
 
     async def _check_one_reminder(self, user: UserRecord, now: datetime) -> None:
@@ -755,6 +1276,45 @@ class ShiftBoardPlugin(Star):
                 f"{line}\n明天不用早起上班，今晚好好休息。",
             )
             return
+
+    async def _check_payday_reminder(self, user: UserRecord, now: datetime) -> None:
+        """发薪日当天，在用户设置的提醒时间问一次「工资到账没有」。"""
+        payroll = await self._payroll(user.user_key, today=now.date())
+        today_text = now.date().isoformat()
+        entries = [
+            item
+            for item in payroll.get("entries", [])
+            if item.get("payday") == today_text and float(item.get("unpaid") or 0) > 0
+        ]
+        if not entries:
+            return
+        target_min = parse_hhmm(user.payday_remind_time, "17:00")
+        target = datetime(now.year, now.month, now.day) + timedelta(minutes=target_min)
+        if not self._in_window(now, target, grace_minutes=240):
+            return
+        fresh: list[dict] = []
+        for item in entries:
+            if await self.store.mark_reminded(
+                user.user_key, today_text, f"payday:{item['salary_month']}"
+            ):
+                fresh.append(item)
+        if not fresh:
+            return
+        total = sum(float(item.get("unpaid") or 0) for item in fresh)
+        detail = "\n".join(
+            f"• {item['month_label']}工资 未发 ¥{float(item['unpaid']):,.2f}"
+            f"（{item['payday_label']}发）"
+            for item in fresh
+        )
+        first_month = fresh[0]["salary_month"]
+        await self._send_text(
+            user.umo,
+            f"💰 发工资啦，{user.nickname}\n"
+            f"{detail}\n"
+            f"合计未发 ¥{total:,.2f}。到账了吗？\n"
+            f"收到后回复「/发薪 到账 {first_month}」，"
+            "或在后台点「登记到账」，我就把这笔划掉。",
+        )
 
     async def _check_overtime_alert(self, user: UserRecord, now: datetime) -> None:
         """上着班超过每日标准工时时，推送一次加班提醒（按天只发一次）。"""
@@ -926,8 +1486,11 @@ class ShiftBoardPlugin(Star):
             return ""
         return text
 
-    def _in_window(self, now: datetime, target: datetime) -> bool:
-        return target <= now < target + timedelta(minutes=self._REMIND_GRACE_MINUTES)
+    def _in_window(
+        self, now: datetime, target: datetime, *, grace_minutes: int | None = None
+    ) -> bool:
+        grace = self._REMIND_GRACE_MINUTES if grace_minutes is None else grace_minutes
+        return target <= now < target + timedelta(minutes=grace)
 
     async def _send_text(self, umo: str, text: str) -> bool:
         if not umo:
@@ -952,7 +1515,11 @@ class ShiftBoardPlugin(Star):
         """查看全部指令（优先发图片）"""
         try:
             url = await self.html_render(
-                render.help_html(), {}, return_url=True, umo=event.unified_msg_origin
+                render.help_html(),
+                {},
+                return_url=True,
+                options=_T2I_OPTIONS,
+                umo=event.unified_msg_origin,
             )
         except Exception as exc:  # noqa: BLE001 - t2i 服务未开时回退文本
             logger.warning("帮助卡片渲染图片失败，回退文本：%s", exc)
@@ -970,7 +1537,11 @@ class ShiftBoardPlugin(Star):
         _, summary = await self._month_stats(user.user_key, month, user.profile)
         yield event.plain_result(
             render.month_text(
-                month, user.nickname, user.profile, [_day_dict(d) for d in summary["days"]], summary
+                month,
+                user.nickname,
+                _profile_from_summary(user.profile, summary),
+                [_day_dict(d) for d in summary["days"]],
+                summary,
             )
         )
         logger.info(
@@ -986,7 +1557,11 @@ class ShiftBoardPlugin(Star):
         _, summary = await self._month_stats(user.user_key, month, user.profile)
         yield event.plain_result(
             render.month_text(
-                month, user.nickname, user.profile, [_day_dict(d) for d in summary["days"]], summary
+                month,
+                user.nickname,
+                _profile_from_summary(user.profile, summary),
+                [_day_dict(d) for d in summary["days"]],
+                summary,
             )
         )
 
@@ -1027,7 +1602,11 @@ class ShiftBoardPlugin(Star):
         yield event.plain_result(
             f"✅ 已切换为月休 {mode} 天，{month_label(month)} 班表已重排。\n\n"
             + render.month_text(
-                month, updated.nickname, updated.profile, [_day_dict(d) for d in summary["days"]], summary
+                month,
+                updated.nickname,
+                _profile_from_summary(updated.profile, summary),
+                [_day_dict(d) for d in summary["days"]],
+                summary,
             )
         )
 
@@ -1296,17 +1875,170 @@ class ShiftBoardPlugin(Star):
         args = _message_args(event)
         month = parse_month(args[0] if args else "")
         _, summary = await self._month_stats(user.user_key, month, user.profile)
+        month_profile = _profile_from_summary(user.profile, summary)
         day_dicts = [_day_dict(d) for d in summary["days"]]
-        html = render.month_html(month, user.nickname, user.profile, day_dicts, summary)
+        html = render.month_html(month, user.nickname, month_profile, day_dicts, summary)
         try:
-            url = await self.html_render(html, {}, return_url=True, umo=event.unified_msg_origin)
+            url = await self.html_render(
+                html, {}, return_url=True, options=_T2I_OPTIONS, umo=event.unified_msg_origin
+            )
         except Exception as exc:  # noqa: BLE001 - t2i 服务未开时回退文本
             logger.warning("排班月历渲染图片失败，回退文本：%s", exc)
             yield event.plain_result(
-                render.month_text(month, user.nickname, user.profile, day_dicts, summary)
+                render.month_text(month, user.nickname, month_profile, day_dicts, summary)
             )
             return
         yield event.image_result(url)
+
+    @filter.command("今日考勤", alias={"考勤", "attendance"})
+    async def today_attendance(self, event: AstrMessageEvent):
+        """单独发一张今日考勤图：今天上了多久、本月/上月应发、未发合计。"""
+        user = await self._user(event)
+        data = await self._attendance_data(user)
+        try:
+            url = await self.html_render(
+                render.attendance_html(data),
+                {},
+                return_url=True,
+                options=_T2I_ATTENDANCE_OPTIONS,
+                umo=event.unified_msg_origin,
+            )
+        except Exception as exc:  # noqa: BLE001 - t2i 服务未开时回退文本
+            logger.warning("今日考勤图片渲染失败，回退文本：%s", exc)
+            yield event.plain_result(
+                f"📋 今日考勤 · {user.nickname}\n"
+                f"今天已上 {data['today_minutes_label']}，距下班 {data['today_remaining_label']}\n"
+                f"今天已获得 {data['today_earned']}（{data['today_hourly']} × {data['today_hours_value']}）\n"
+                f"{data['month_label']}应发 {data['month_due']}，未发 {data['month_unpaid']}\n"
+                f"{data['prev_label']}应发 {data['prev_due']}，未发 {data['prev_unpaid']}\n"
+                f"所有未发合计 {data['unpaid_total']}"
+            )
+            return
+        yield event.image_result(url)
+
+    # ------------------------------------------------------------------ #
+    # /发薪
+    # ------------------------------------------------------------------ #
+    @filter.command_group("发薪", alias={"发工资", "payday"})
+    def payroll_group(self):
+        """发薪规则、到账登记与发薪日提醒"""
+
+    @payroll_group.command("查看", alias={"状态", "列表"})
+    async def payroll_view(self, event: AstrMessageEvent):
+        """查看发薪规则、下一笔和未发合计"""
+        user = await self._user(event)
+        payroll = await self._payroll(user.user_key)
+        yield event.plain_result(render.payroll_center_text(payroll, user.nickname))
+
+    @payroll_group.command("月底", alias={"当月", "same"})
+    async def payroll_month_end(self, event: AstrMessageEvent):
+        """切换为当月工资当月月底发"""
+        user = await self._user(event)
+        updated = await self.store.update_profile(user.user_key, payday_mode="month_end")
+        if updated is None:
+            yield event.plain_result("保存失败，请稍后再试。")
+            return
+        yield event.plain_result(
+            "✅ 已切换为「当月月底发」：每个月最后一天发当月工资。"
+            " 查看：/发薪 查看"
+        )
+
+    @payroll_group.command("次月", alias={"压一月", "next"})
+    async def payroll_next_month(self, event: AstrMessageEvent):
+        """切换为压一个月，次月指定日期发"""
+        user = await self._user(event)
+        args = _message_args(event)
+        day = user.payday_day
+        if args:
+            digits = re.sub(r"\D", "", args[0])
+            if digits:
+                day = int(digits)
+        if not 1 <= day <= 31:
+            yield event.plain_result("发薪日需在 1 ~ 31 号之间。")
+            return
+        updated = await self.store.update_profile(
+            user.user_key, payday_mode="next_month", payday_day=day
+        )
+        if updated is None:
+            yield event.plain_result("保存失败，请稍后再试。")
+            return
+        yield event.plain_result(
+            f"✅ 已切换为「压一月」：上月工资在次月 {day} 号发。"
+            f" 例如 10 月工资会在 11 月 {day} 号发。"
+        )
+
+    @payroll_group.command("提醒", alias={"remind"})
+    async def payroll_remind(self, event: AstrMessageEvent):
+        """发薪日提醒开关 / 改提醒时间"""
+        user = await self._user(event)
+        args = _message_args(event)
+        if not args:
+            yield event.plain_result(
+                f"发薪日提醒：{'开' if user.payday_remind_enabled else '关'}"
+                f" · 时间 {user.payday_remind_time}"
+                "\n改时间：/发薪 提醒 17:30"
+                "\n开关：/发薪 提醒 开 或 /发薪 提醒 关"
+            )
+            return
+        token = args[0].strip()
+        if token in {"开", "开启", "on"}:
+            await self.store.update_profile(user.user_key, payday_remind_enabled=True)
+            yield event.plain_result(
+                f"✅ 发薪日提醒已开，发薪日 {user.payday_remind_time} 会问工资到账没有。"
+            )
+            return
+        if token in {"关", "关闭", "off"}:
+            await self.store.update_profile(user.user_key, payday_remind_enabled=False)
+            yield event.plain_result("✅ 发薪日提醒已关。")
+            return
+        remind_time = normalize_hhmm(token, user.payday_remind_time)
+        await self.store.update_profile(
+            user.user_key, payday_remind_enabled=True, payday_remind_time=remind_time
+        )
+        yield event.plain_result(f"✅ 发薪日提醒时间已改为 {remind_time}。")
+
+    @payroll_group.command("到账", alias={"登记", "paid"})
+    async def payroll_paid(self, event: AstrMessageEvent):
+        """登记某个月工资已到账"""
+        user = await self._user(event)
+        args = _message_args(event)
+        month = _salary_month(args, f"{date.today():%Y-%m}")
+        payroll = await self._payroll(user.user_key)
+        entry = next(
+            (item for item in payroll.get("entries", []) if item["salary_month"] == month),
+            None,
+        )
+        if entry is None:
+            yield event.plain_result(f"{month_label(month)}还没有可登记的应发工资。")
+            return
+        amount = entry["due"]
+        if len(args) > 1:
+            parsed = _number(args[1])
+            if parsed is not None:
+                amount = max(0.0, min(float(entry["due"]), float(parsed)))
+        await self.store.save_payout(
+            user.user_key,
+            month,
+            amount=amount,
+            paid_on=date.today().isoformat(),
+            note="聊天登记到账",
+        )
+        yield event.plain_result(
+            f"✅ 已登记 {month_label(month)}工资到账 ¥{amount:,.2f}。"
+            f" 查看：/发薪 查看"
+        )
+
+    @payroll_group.command("撤销", alias={"撤回", "unpay"})
+    async def payroll_unpay(self, event: AstrMessageEvent):
+        """撤销某个月工资的到账登记"""
+        user = await self._user(event)
+        args = _message_args(event)
+        month = _salary_month(args, f"{date.today():%Y-%m}")
+        deleted = await self.store.delete_payout(user.user_key, month)
+        if not deleted:
+            yield event.plain_result(f"{month_label(month)}没有到账登记。")
+            return
+        yield event.plain_result(f"✅ 已撤销 {month_label(month)}工资的到账登记。")
 
     # ------------------------------------------------------------------ #
     # /打卡
@@ -1408,10 +2140,13 @@ class ShiftBoardPlugin(Star):
         )
         opened = next((p for p in punches if p.is_open), None)
         open_info = None
+        closed_minutes_total = sum(
+            max(0, int(p.minutes or 0)) for p in punches if not p.is_open
+        )
+        today_minutes = closed_minutes_total
         if opened:
-            open_minutes = shift_minutes(
-                opened.start, _now_hhmm(), 0
-            )
+            open_minutes = shift_minutes(opened.start, _now_hhmm(), 0)
+            today_minutes += open_minutes
             open_info = {
                 "start": opened.start,
                 "elapsed_minutes": open_minutes,
@@ -1420,8 +2155,12 @@ class ShiftBoardPlugin(Star):
             render.status_text(
                 [_day_dict(d) for d in summary["days"]],
                 user.nickname,
-                user.profile,
+                _profile_from_summary(user.profile, summary),
                 open_info,
+                now_label=datetime.now().strftime("%H:%M"),
+                today_minutes=today_minutes,
+                today_remaining_minutes=int(summary.get("today_remaining_minutes", 0) or 0),
+                today_end_label=str(summary.get("today_end_label", "") or ""),
             )
         )
 
@@ -1507,7 +2246,7 @@ class ShiftBoardPlugin(Star):
             render.hours_text(
                 f"今日 {today.month}/{today.day}",
                 user.nickname,
-                user.profile,
+                _profile_from_summary(user.profile, summary),
                 summary,
             )
         )
@@ -1521,7 +2260,7 @@ class ShiftBoardPlugin(Star):
             render.hours_text(
                 f"本周 {start.month}/{start.day}~{end.month}/{end.day}",
                 user.nickname,
-                user.profile,
+                _profile_from_summary(user.profile, summary),
                 summary,
             )
         )
@@ -1535,7 +2274,10 @@ class ShiftBoardPlugin(Star):
         _, summary = await self._month_stats(user.user_key, month, user.profile)
         yield event.plain_result(
             render.hours_text(
-                month_label(month), user.nickname, user.profile, summary
+                month_label(month),
+                user.nickname,
+                _profile_from_summary(user.profile, summary),
+                summary,
             )
         )
 
@@ -1555,7 +2297,7 @@ class ShiftBoardPlugin(Star):
             render.hours_text(
                 f"{month_label(month)} 明细",
                 user.nickname,
-                user.profile,
+                _profile_from_summary(user.profile, summary),
                 summary,
                 detail_days=detail,
             )
@@ -1588,24 +2330,31 @@ class ShiftBoardPlugin(Star):
             yield event.plain_result("时薪范围请控制在 0 ~ 10000 元/小时。")
             return
         overtime = user.profile.overtime_rate
+        month_args = args[2:]
         if len(args) > 1:
-            try:
-                overtime = float(args[1].replace("×", "").replace("x", ""))
-            except ValueError:
-                overtime = user.profile.overtime_rate
-            overtime = max(1.0, min(10.0, overtime))
-        updated = await self.store.update_profile(
-            user.user_key, hourly_rate=rate, overtime_rate=overtime, pay_mode="hourly"
+            if _is_month_token(args[1]):
+                month_args = args[1:]
+            else:
+                try:
+                    overtime = float(args[1].replace("×", "").replace("x", ""))
+                except ValueError:
+                    overtime = user.profile.overtime_rate
+                overtime = max(1.0, min(10.0, overtime))
+        month = _salary_month(month_args, f"{date.today():%Y-%m}")
+        updated = await self._save_month_salary(
+            user.user_key, month, hourly_rate=rate, pay_mode="hourly", note="指令设置时薪"
         )
         if updated is None:
             yield event.plain_result("保存失败，请稍后再试。")
             return
-        month = f"{date.today():%Y-%m}"
+        if overtime != user.profile.overtime_rate:
+            updated = await self.store.update_profile(user.user_key, overtime_rate=overtime) or updated
         _, summary = await self._month_stats(updated.user_key, month, updated.profile)
         yield event.plain_result(
-            f"✅ 时薪已设为 ¥{rate:g}/h，加班 ×{overtime:g}，计薪方式切到「时薪」。\n"
-            f"按 {updated.profile.shift_start}-{updated.profile.shift_end} 每班 "
-            f"{human_minutes(updated.profile.daily_minutes)}，日薪约 ¥{updated.profile.daily_minutes / 60 * rate:,.2f}。\n\n"
+            f"✅ {month_label(month)} 时薪已设为 ¥{rate:g}/h，加班 ×{overtime:g}，计薪方式「时薪」。\n"
+            f"该月按 {updated.profile.shift_start}-{updated.profile.shift_end} 每班 "
+            f"{human_minutes(updated.profile.daily_minutes)}，日薪约 ¥{updated.profile.daily_minutes / 60 * rate:,.2f}。\n"
+            f"其他月份工资不受影响。\n\n"
             + render.summary_block(summary)
         )
 
@@ -1668,20 +2417,103 @@ class ShiftBoardPlugin(Star):
         if salary > 1000000:
             yield event.plain_result("月薪范围请控制在 0 ~ 1000000 元。")
             return
-        updated = await self.store.update_profile(
-            user.user_key, monthly_salary=salary, pay_mode="monthly"
+        month = _salary_month(args[1:], f"{date.today():%Y-%m}")
+        updated = await self._save_month_salary(
+            user.user_key, month, monthly_salary=salary, pay_mode="monthly", note="指令设置月薪"
         )
         if updated is None:
             yield event.plain_result("保存失败，请稍后再试。")
             return
-        month = f"{date.today():%Y-%m}"
         _, summary = await self._month_stats(updated.user_key, month, updated.profile)
         yield event.plain_result(
-            f"✅ 月薪已设为 ¥{salary:,.2f}，计薪方式切到「月薪」。\n"
-            f"按本月排班计划 {human_minutes(summary['planned_minutes'])} 折算，"
-            f"时薪约 ¥{summary['hourly_rate']:g}/h，日薪约 ¥{summary['daily_pay']:,.2f}。\n\n"
+            f"✅ {month_label(month)} 月薪已设为 ¥{salary:,.2f}，计薪方式「月薪」。\n"
+            f"按该月合同 {summary['contract_work_days']} 个工作日折算，"
+            f"时薪约 ¥{summary['hourly_rate']:g}/h，日薪约 ¥{summary['daily_pay']:,.2f}。\n"
+            f"其他月份会保留原来的工资，不会被这次涨薪覆盖。\n\n"
             + render.summary_block(summary)
         )
+
+    @pay_group.command("阶段", alias={"stage", "身份"})
+    async def pay_stage(self, event: AstrMessageEvent):
+        """按月份标记实习 / 正式：/工薪 阶段 实习 2026-10"""
+        user = await self._user(event)
+        args = _message_args(event)
+        if not args:
+            records = await self.store.list_salary_records(user.user_key)
+            lines = [f"当前身份：{stage_label(user.profile.employment_stage)}"]
+            if records:
+                lines.append("按月记录：")
+                for item in records[-8:]:
+                    lines.append(
+                        f"· {item['month']} {stage_label(item['stage'])}"
+                        f" · 月薪 ¥{float(item['monthly_salary'] or 0):,.2f}"
+                        f" / 时薪 ¥{float(item['hourly_rate'] or 0):g}"
+                    )
+            lines.append("设置示例：/工薪 阶段 实习 2026-10")
+            yield event.plain_result("\n".join(lines))
+            return
+        target = _parse_stage(args[0])
+        if target is None:
+            yield event.plain_result("身份只支持「实习」或「正式」，例如：/工薪 阶段 正式 2026-11")
+            return
+        month = _salary_month(args[1:], f"{date.today():%Y-%m}")
+        updated = await self._save_month_salary(
+            user.user_key, month, employment_stage=target, note="指令设置工资阶段"
+        )
+        if updated is None:
+            yield event.plain_result("保存失败，请稍后再试。")
+            return
+        _, summary = await self._month_stats(updated.user_key, month, updated.profile)
+        pay_text = (
+            f"月薪 ¥{summary['monthly_salary']:,.2f}"
+            if summary.get("pay_mode") == "monthly"
+            else f"时薪 ¥{summary['hourly_rate']:g}/h"
+        )
+        yield event.plain_result(
+            f"✅ {month_label(month)} 已标记为「{stage_label(target)}」，{pay_text}。\n"
+            "只改这个月的身份和工资档案，其他月份保持不变。\n"
+            "查看全年：/工薪 年收入"
+        )
+
+    @pay_group.command("年收入", alias={"年薪", "annual", "year"})
+    async def pay_annual(self, event: AstrMessageEvent):
+        """按实际打卡累计的年收入，不用未来班表预测。"""
+        user = await self._user(event)
+        args = _message_args(event)
+        year = f"{date.today():%Y}"
+        for token in args:
+            match = re.search(r"20\d{2}", token)
+            if match:
+                year = match.group()
+                break
+        annual = await self._annual_income(user.user_key, year)
+        if not annual["months"]:
+            yield event.plain_result(f"{year} 年还没有排班或打卡，先发 /排班 生成 排出班表。")
+            return
+        lines = [
+            f"📈 {year} 年实际收入（按已经上班的天数累计，不含未来预测）",
+            f"应发 ¥{annual['total']:,.2f} · 到手 ¥{annual['net_total']:,.2f}"
+            f" · 已上 {annual['paid_days']} 天",
+        ]
+        for key in ("intern", "regular"):
+            bucket = annual["by_stage"].get(key)
+            if bucket and (bucket["paid_days"] or bucket["total"]):
+                lines.append(
+                    f"· {bucket['label']}期：¥{bucket['total']:,.2f}"
+                    f"（到手 ¥{bucket['net_total']:,.2f}，{bucket['paid_days']} 天）"
+                )
+        lines.append("按月：")
+        for row in annual["months"]:
+            pay = (
+                f"月薪 ¥{row['monthly_salary']:,.2f}"
+                if row["pay_mode"] == "monthly"
+                else f"时薪 ¥{row['hourly_rate']:g}"
+            )
+            lines.append(
+                f"· {row['month_label']} {row['stage_label']} · {pay}"
+                f" · 上 {row['paid_days']} 天 · 应发 ¥{row['earned_pay']:,.2f}"
+            )
+        yield event.plain_result("\n".join(lines))
 
     @pay_group.command("本月", alias={"month"})
     async def pay_month(self, event: AstrMessageEvent):
@@ -1694,7 +2526,7 @@ class ShiftBoardPlugin(Star):
             render.payroll_text(
                 month_label(month),
                 user.nickname,
-                user.profile,
+                _profile_from_summary(user.profile, summary),
                 summary,
                 [_day_dict(d) for d in summary["days"]],
             )
@@ -1707,7 +2539,7 @@ class ShiftBoardPlugin(Star):
         args = _message_args(event)
         month = parse_month(args[0] if args else "")
         _, summary = await self._month_stats(user.user_key, month, user.profile)
-        if user.profile.hourly_rate <= 0 and user.profile.monthly_salary <= 0:
+        if summary["hourly_rate"] <= 0 and summary["monthly_salary"] <= 0:
             yield event.plain_result(
                 "还没设置工资，先发「/工薪 时薪 22.5」或「/工薪 月薪 5000」。"
             )
@@ -1715,7 +2547,7 @@ class ShiftBoardPlugin(Star):
         planned_hours = summary["planned_minutes"] / 60
         if summary["pay_mode"] == "monthly":
             projected = summary["projected_pay"]
-            basis = f"月薪 ¥{user.profile.monthly_salary:,.2f}（折算 ¥{summary['hourly_rate']:g}/h）"
+            basis = f"月薪 ¥{summary['monthly_salary']:,.2f}（折算 ¥{summary['hourly_rate']:g}/h）"
         else:
             projected = planned_hours * summary["hourly_rate"]
             projected += (
@@ -2130,6 +2962,8 @@ class ShiftBoardPlugin(Star):
     async def ai_schedule(self, event: AstrMessageEvent, month: str = "") -> str:
         """查询当前说话人的整月排班表：工作日、休息日、班次、工时与工资概览。
 
+        这里只返回文字；用户要「排班图 / 班表图片」时请调用 shift_schedule_image。
+
         Args:
             month(string): 月份，格式 YYYY-MM；留空表示本月。
         """
@@ -2159,6 +2993,43 @@ class ShiftBoardPlugin(Star):
             f"实发 ¥{summary['total_pay']:,.2f}（罚款 -¥{summary['fine_total']:g}）"
             f"，全月预计 ¥{summary['projected_pay']:,.2f}"
         )
+
+    @filter.llm_tool("shift_schedule_image")
+    async def ai_schedule_image(self, event: AstrMessageEvent, month: str = "") -> str:
+        """生成并单独发送当前说话人的整月排班表图片（排班月历）。
+
+        用户说「排班图」「把排班表发成图片」「看看这个月怎么排」「下个月排班图」时调用本工具。
+        只问文字版班表、休息日、班次、工时或工资时，用 shift_get_schedule。
+
+        Args:
+            month(string): 月份，格式 YYYY-MM；也可以说本月、下个月、上个月；留空表示本月。
+        """
+        user = await self._user(event)
+        target = parse_month(month)
+        _, summary = await self._month_stats(user.user_key, target, user.profile)
+        month_profile = _profile_from_summary(user.profile, summary)
+        day_dicts = [_day_dict(d) for d in summary["days"]]
+        html = render.month_html(
+            target, user.nickname, month_profile, day_dicts, summary
+        )
+        try:
+            url = await self.html_render(
+                html,
+                {},
+                return_url=True,
+                options=_T2I_OPTIONS,
+                umo=event.unified_msg_origin,
+            )
+        except Exception as exc:  # noqa: BLE001 - t2i 服务未开时回退文本
+            logger.warning("AI 排班图渲染失败，回退文本：%s", exc)
+            return (
+                f"{month_label(target)}排班图生成失败，先把文字班表发你：\n"
+                + render.month_text(
+                    target, user.nickname, month_profile, day_dicts, summary
+                )
+            )
+        await event.send(MessageChain([Image.fromURL(url)]))
+        return f"{month_label(target)}排班图已单独发送。"
 
     @filter.llm_tool("shift_get_today")
     async def ai_today(self, event: AstrMessageEvent) -> str:
@@ -2192,6 +3063,121 @@ class ShiftBoardPlugin(Star):
             else ""
         )
         return f"{head}\n{state}{over}"
+
+    @filter.llm_tool("shift_today_attendance")
+    async def ai_today_attendance(self, event: AstrMessageEvent) -> str:
+        """生成并发送一张「今日考勤」图片给当前说话人：今天上了多久、按小时累计今天已获得多少钱、距下班还剩多久、本月和上月应发与未发、未发合计。用户说「今日考勤」时调用。"""
+        user = await self._user(event)
+        data = await self._attendance_data(user)
+        try:
+            url = await self.html_render(
+                render.attendance_html(data),
+                {},
+                return_url=True,
+                options=_T2I_ATTENDANCE_OPTIONS,
+                umo=event.unified_msg_origin,
+            )
+            await event.send(MessageChain([Image.fromURL(url)]))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AI 今日考勤图片生成失败：%s", exc)
+            return (
+                f"今日考勤：今天已上 {data['today_minutes_label']}，"
+                f"今天已获得 {data['today_earned']}（{data['today_hourly']} × {data['today_hours_value']}），"
+                f"距下班 {data['today_remaining_label']}；"
+                f"{data['month_label']}应发 {data['month_due']}、未发 {data['month_unpaid']}；"
+                f"所有未发 {data['unpaid_total']}。"
+            )
+        return "今日考勤图片已单独发送。"
+
+    @filter.llm_tool("shift_get_payroll")
+    async def ai_payroll(self, event: AstrMessageEvent) -> str:
+        """查询发薪规则、下一笔发薪日、每月应发/已到账/未发合计。"""
+        user = await self._user(event)
+        return render.payroll_center_text(await self._payroll(user.user_key), user.nickname)
+
+    @filter.llm_tool("shift_set_payroll")
+    async def ai_set_payroll(
+        self,
+        event: AstrMessageEvent,
+        mode: str = "",
+        payday_day: str = "",
+        remind_enabled: str = "",
+        remind_time: str = "",
+    ) -> str:
+        """设置发薪规则与发薪日提醒。只有用户明确要求改发薪规则时调用。
+
+        Args:
+            mode(string): month_end=当月月底发；next_month=压一月、次月发。
+            payday_day(string): 压一月时，次月几号发，1~31；留空不改。
+            remind_enabled(string): 发薪日提醒开/关，填 on 或 off；留空不改。
+            remind_time(string): 发薪日提醒时间，HH:MM；留空不改。
+        """
+        user = await self._user(event)
+        fields: dict = {}
+        raw_mode = (mode or "").strip().lower()
+        if raw_mode:
+            if raw_mode in {"月底", "当月", "月终", "month_end"}:
+                raw_mode = "month_end"
+            elif raw_mode in {"次月", "压一月", "下月", "next_month"}:
+                raw_mode = "next_month"
+            else:
+                return "mode 只能是 month_end（月底发）或 next_month（压一月发）。"
+            fields["payday_mode"] = raw_mode
+        if payday_day:
+            digits = re.sub(r"\D", "", str(payday_day))
+            if not digits or not 1 <= int(digits) <= 31:
+                return "发薪日需在 1~31 号之间。"
+            fields["payday_day"] = int(digits)
+        if remind_enabled not in {"", None}:
+            fields["payday_remind_enabled"] = str(remind_enabled).strip().lower() in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "开",
+                "开启",
+            }
+        if remind_time:
+            fields["payday_remind_time"] = normalize_hhmm(remind_time, user.payday_remind_time)
+        if not fields:
+            return render.payroll_center_text(await self._payroll(user.user_key), user.nickname)
+        await self.store.update_profile(user.user_key, **fields)
+        payroll = await self._payroll(user.user_key)
+        return "已保存发薪规则。\n" + render.payroll_center_text(payroll, user.nickname)
+
+    @filter.llm_tool("shift_mark_salary_paid")
+    async def ai_mark_salary_paid(
+        self, event: AstrMessageEvent, salary_month: str = "", amount: str = ""
+    ) -> str:
+        """登记某个月工资已到账；用户明确说「工资到账了」时才调用。
+
+        Args:
+            salary_month(string): 工资所属月份 YYYY-MM；留空为本月。
+            amount(string): 该月累计到账金额，只填数字；留空表示按剩余未发金额全部登记。
+        """
+        user = await self._user(event)
+        month = _salary_month([salary_month], f"{date.today():%Y-%m}")
+        if month > f"{date.today():%Y-%m}":
+            return "不能登记未来月份的工资。"
+        payroll = await self._payroll(user.user_key)
+        entry = next(
+            (item for item in payroll.get("entries", []) if item["salary_month"] == month),
+            None,
+        )
+        if entry is None:
+            return f"{month_label(month)}没有可登记的应发工资。"
+        paid = entry["due"]
+        parsed = _number(amount)
+        if parsed is not None and float(parsed) > 0:
+            paid = min(float(entry["due"]), float(parsed))
+        await self.store.save_payout(
+            user.user_key,
+            month,
+            amount=paid,
+            paid_on=date.today().isoformat(),
+            note="AI 登记到账",
+        )
+        return f"已登记 {month_label(month)}工资到账 ¥{paid:,.2f}。还有未发 ¥{max(0.0, entry['due'] - paid):,.2f}。"
 
     @filter.llm_tool("shift_get_hours")
     async def ai_hours(self, event: AstrMessageEvent, range: str = "本月") -> str:
@@ -2242,7 +3228,7 @@ class ShiftBoardPlugin(Star):
         user = await self._user(event)
         target = parse_month(month)
         _, summary = await self._month_stats(user.user_key, target, user.profile)
-        if user.profile.hourly_rate <= 0 and user.profile.monthly_salary <= 0:
+        if summary["hourly_rate"] <= 0 and summary["monthly_salary"] <= 0:
             return (
                 f"{user.nickname} 还没设置工资，算不出来。"
                 "可以让 TA 发「/工薪 时薪 22.5」或「/工薪 月薪 5000」，"
@@ -2250,14 +3236,14 @@ class ShiftBoardPlugin(Star):
             )
         if summary["pay_mode"] == "monthly":
             rate_line = (
-                f"月薪 ¥{user.profile.monthly_salary:,.2f}"
-                f"（按本月计划 {human_minutes(summary['planned_minutes'])} 折算 ¥{summary['hourly_rate']:g}/h），"
+                f"{summary.get('stage_label', '')}，月薪 ¥{summary['monthly_salary']:,.2f}"
+                f"（按本月合同工作日折算 ¥{summary['hourly_rate']:g}/h），"
                 f"每日超 {user.profile.standard_hours:g}h 算加班，倍率 ×{user.profile.overtime_rate:g}\n"
             )
             normal_line = f"月薪基数 ¥{summary['normal_pay']:,.2f}\n"
         else:
             rate_line = (
-                f"时薪 ¥{user.profile.hourly_rate:g}/h，每日超 "
+                f"{summary.get('stage_label', '')}，时薪 ¥{summary['hourly_rate']:g}/h，每日超 "
                 f"{user.profile.standard_hours:g}h 算加班，倍率 ×{user.profile.overtime_rate:g}\n"
             )
             normal_line = (
@@ -2281,8 +3267,42 @@ class ShiftBoardPlugin(Star):
                 if summary.get("deduction_items")
                 else ""
             )
-            + f"到手 ¥{summary['total_pay']:,.2f}，全月干满预计 ¥{summary['projected_pay']:,.2f}"
+            + f"到手 ¥{summary['total_pay']:,.2f}，实际已挣 ¥{summary['earned_pay']:,.2f}"
+            f"，全月干满预计 ¥{summary['projected_pay']:,.2f}"
         )
+
+    @filter.llm_tool("shift_get_annual_income")
+    async def ai_annual_income(self, event: AstrMessageEvent, year: str = "") -> str:
+        """查询当前说话人某年的实际收入：按已打卡上班的天数累计，不是全月预测。
+
+        Args:
+            year(string): 四位年份，如 "2026"；留空表示今年。
+        """
+        user = await self._user(event)
+        target = f"{date.today():%Y}"
+        match = re.search(r"20\d{2}", str(year or ""))
+        if match:
+            target = match.group()
+        annual = await self._annual_income(user.user_key, target)
+        if not annual["months"]:
+            return f"{user.nickname} {target} 年还没有排班或打卡，暂无实际收入。"
+        lines = [
+            f"{user.nickname} · {target} 年实际收入（已按打卡天数累计，不含未来预测）",
+            f"应发 ¥{annual['total']:,.2f}，到手 ¥{annual['net_total']:,.2f}，已上 {annual['paid_days']} 天",
+        ]
+        for key in ("intern", "regular"):
+            bucket = annual["by_stage"].get(key)
+            if bucket and (bucket["paid_days"] or bucket["total"]):
+                lines.append(
+                    f"{bucket['label']}期 ¥{bucket['total']:,.2f}"
+                    f"（到手 ¥{bucket['net_total']:,.2f}，{bucket['paid_days']} 天）"
+                )
+        for row in annual["months"]:
+            lines.append(
+                f"{row['month_label']} {row['stage_label']}：上 {row['paid_days']} 天，"
+                f"应发 ¥{row['earned_pay']:,.2f}，到手 ¥{row['earned_net']:,.2f}"
+            )
+        return "\n".join(lines)
 
     @filter.llm_tool("shift_get_profile")
     async def ai_get_profile(self, event: AstrMessageEvent) -> str:
@@ -2315,16 +3335,21 @@ class ShiftBoardPlugin(Star):
         hourly_rate: str = "",
         pay_mode: str = "",
         overtime_rate: str = "",
+        month: str = "",
+        employment_stage: str = "",
     ) -> str:
-        """设置当前说话人的工资口径：月薪或时薪。
+        """设置当前说话人的工资口径：月薪或时薪，可按月份保存并标记实习/正式。
         只有用户本轮明确说出自己的月薪/时薪数字时才调用；没说数字就不要猜。
         说「月薪 5000」就填 monthly_salary；说「时薪 18」就填 hourly_rate；两个都说了就都填，pay_mode 按用户主要口径填。
+        说「上个月 3000，这个月 5000」时，month 填对应月份、monthly_salary 填对应数字，调用两次，不要互相覆盖。
 
         Args:
             monthly_salary(string): 月薪金额，只填数字，如 "5000"；没提到就留空。
             hourly_rate(string): 时薪金额，只填数字，如 "18"；没提到就留空。
             pay_mode(string): 计薪口径，只能填 hourly 或 monthly；留空时按填了哪个自动判断（只填月薪用 monthly，只填时薪用 hourly）。
             overtime_rate(string): 加班倍率，如 "1.5"；留空表示不改。
+            month(string): 月份，格式 YYYY-MM，如 "2026-10"；留空表示本月。
+            employment_stage(string): 实习 / 正式，或 intern / regular；留空表示不改。
         """
         if not bool(self.config.get("enable_ai_pay", True)):
             return "管理员没有开启「允许 AI 改工资」，这次没有写库。可以让用户发 /工薪 时薪 或 /工薪 月薪。"
@@ -2332,6 +3357,7 @@ class ShiftBoardPlugin(Star):
         user = await self._user(event)
         updates: dict[str, object] = {}
         notes: list[str] = []
+        target_month = _salary_month([month], f"{date.today():%Y-%m}") if str(month or "").strip() else f"{date.today():%Y-%m}"
 
         salary = _number(monthly_salary) if str(monthly_salary or "").strip() else None
         if salary is not None:
@@ -2345,6 +3371,10 @@ class ShiftBoardPlugin(Star):
                 return "时薪金额看起来不合理，请用户确认具体数字后再说一次。"
             updates["hourly_rate"] = rate
             notes.append(f"时薪 ¥{rate:g}/h")
+        stage = _parse_stage(employment_stage)
+        if stage:
+            updates["employment_stage"] = stage
+            notes.append(stage_label(stage))
         if not updates:
             return "没有听到具体的月薪或时薪数字，请用户再说一次。"
 
@@ -2359,29 +3389,42 @@ class ShiftBoardPlugin(Star):
             mode = "hourly"
         else:
             mode = user.profile.pay_mode
-        if mode == "monthly" and "monthly_salary" not in updates and user.profile.monthly_salary <= 0:
-            mode = "hourly"
+        if mode == "monthly" and "monthly_salary" not in updates:
+            existing = await self._profile_for_month(user.user_key, target_month, user.profile)
+            if existing.monthly_salary <= 0:
+                mode = "hourly"
         updates["pay_mode"] = mode
 
         overtime = _number(overtime_rate) if str(overtime_rate or "").strip() else None
         if overtime is not None:
             updates["overtime_rate"] = max(1.0, min(10.0, overtime))
 
-        updated = await self.store.update_profile(user.user_key, **updates)
+        updated = await self._save_month_salary(
+            user.user_key,
+            target_month,
+            monthly_salary=updates.get("monthly_salary"),
+            hourly_rate=updates.get("hourly_rate"),
+            pay_mode=updates.get("pay_mode"),
+            employment_stage=updates.get("employment_stage"),
+            note="AI 按月份设置",
+        )
         if updated is None:
             return "保存失败，请稍后再试。"
+        if overtime is not None:
+            updated = await self.store.update_profile(user.user_key, overtime_rate=overtime) or updated
 
-        month = f"{date.today():%Y-%m}"
-        _, summary = await self._month_stats(updated.user_key, month, updated.profile)
+        _, summary = await self._month_stats(updated.user_key, target_month, updated.profile)
         basis = (
-            f"月薪 ¥{updated.profile.monthly_salary:,.2f}，折算时薪 ¥{summary['hourly_rate']:g}/h"
+            f"月薪 ¥{summary['monthly_salary']:,.2f}，折算时薪 ¥{summary['hourly_rate']:g}/h"
             if summary["pay_mode"] == "monthly"
-            else f"时薪 ¥{updated.profile.hourly_rate:g}/h"
+            else f"时薪 ¥{summary['hourly_rate']:g}/h"
         )
         return (
-            f"已设置{'、'.join(notes)}，计薪方式：{'月薪' if summary['pay_mode'] == 'monthly' else '时薪'}\n"
+            f"已设置{month_label(target_month)}：{'、'.join(notes)}，"
+            f"计薪方式：{'月薪' if summary['pay_mode'] == 'monthly' else '时薪'}，"
+            f"身份：{summary.get('stage_label', '')}\n"
             f"{basis}，日薪约 ¥{summary['daily_pay']:,.2f}\n"
-            f"{month_label(month)}实发 ¥{summary['total_pay']:,.2f}，全月预计 ¥{summary['projected_pay']:,.2f}"
+            f"该月实发 ¥{summary['total_pay']:,.2f}，实际已挣 ¥{summary['earned_pay']:,.2f}；其他月份工资不变。"
         )
 
     @filter.llm_tool("shift_set_reminder")
@@ -2976,12 +4019,16 @@ class ShiftBoardPlugin(Star):
         if record is None:
             return {}
         _, summary = await self._month_stats(user_key, month, record.profile)
+        annual = await self._annual_income(user_key, month[:4])
+        payroll = await self._payroll(user_key)
         return {
             "active": record.to_dict(),
             "month": month,
             "month_label": month_label(month),
             "days": [_day_dict(day) for day in summary["days"]],
             "summary": _summary_dict(summary),
+            "annual": annual,
+            "payroll": payroll,
         }
 
     async def api_state(self):
@@ -2996,6 +4043,8 @@ class ShiftBoardPlugin(Star):
                     "month_label": month_label(month),
                     "days": [],
                     "summary": None,
+                    "annual": None,
+                    "payroll": None,
                 }
             )
         wanted = request.query.get("user", "")
@@ -3034,6 +4083,11 @@ class ShiftBoardPlugin(Star):
                 if mode not in {"hourly", "monthly"}:
                     return error_response("计薪方式只支持 hourly / monthly")
                 fields["pay_mode"] = mode
+            if "employment_stage" in payload:
+                stage = str(payload["employment_stage"] or "").lower()
+                if stage not in {"intern", "regular"}:
+                    return error_response("工资阶段只支持 intern（实习）/ regular（正式）")
+                fields["employment_stage"] = stage
             if "overtime_rate" in payload:
                 overtime = float(payload["overtime_rate"])
                 if not 1 <= overtime <= 10:
@@ -3091,14 +4145,29 @@ class ShiftBoardPlugin(Star):
         except (TypeError, ValueError):
             return error_response("参数格式不正确")
 
-        if fields.get("monthly_salary", 0) > 0 and "pay_mode" not in fields:
-            fields["pay_mode"] = "monthly"
-        salary_value = fields.get("monthly_salary", record.profile.monthly_salary)
-        if fields.get("pay_mode") == "monthly" and float(salary_value or 0) <= 0:
-            return error_response("按月薪计薪要先填月薪金额")
-
-        await self.store.update_profile(user_key, **fields)
         month = parse_month(payload.get("month", ""))
+        salary_keys = {"hourly_rate", "monthly_salary", "pay_mode", "employment_stage"}
+        salary_fields = {key: fields.pop(key) for key in list(fields) if key in salary_keys}
+
+        if salary_fields:
+            if salary_fields.get("monthly_salary", 0) > 0 and "pay_mode" not in salary_fields:
+                salary_fields["pay_mode"] = "monthly"
+            month_profile = await self._profile_for_month(user_key, month, record.profile)
+            salary_value = salary_fields.get("monthly_salary", month_profile.monthly_salary)
+            if salary_fields.get("pay_mode") == "monthly" and float(salary_value or 0) <= 0:
+                return error_response("按月薪计薪要先填月薪金额")
+            await self._save_month_salary(
+                user_key,
+                month,
+                monthly_salary=salary_fields.get("monthly_salary"),
+                hourly_rate=salary_fields.get("hourly_rate"),
+                pay_mode=salary_fields.get("pay_mode"),
+                employment_stage=salary_fields.get("employment_stage"),
+                note="后台按月份保存",
+            )
+
+        if fields:
+            await self.store.update_profile(user_key, **fields)
 
         rebuild_keys = {
             "shift_start",
@@ -3113,6 +4182,96 @@ class ShiftBoardPlugin(Star):
                 await self._rebuild_month(user_key, month, updated.profile)
 
         return json_response({"saved": True, **await self._snapshot(user_key, month)})
+
+    async def api_payroll_save(self):
+        payload = await request.json(default={})
+        user_key = str(payload.get("user") or "")
+        record = await self.store.get_user(user_key)
+        if record is None:
+            return error_response("找不到这个用户", status_code=404)
+        mode = str(payload.get("payday_mode") or "month_end").lower()
+        if mode not in {"month_end", "next_month"}:
+            return error_response("发薪规则只支持 month_end / next_month")
+        try:
+            payday_day = int(payload.get("payday_day", 15) or 15)
+        except (TypeError, ValueError):
+            return error_response("发薪日需为 1 ~ 31 的整数")
+        if not 1 <= payday_day <= 31:
+            return error_response("发薪日需为 1 ~ 31 的整数")
+        remind_enabled = bool(payload.get("payday_remind_enabled", True))
+        remind_time = normalize_hhmm(
+            payload.get("payday_remind_time") or record.payday_remind_time, "17:00"
+        )
+        await self.store.update_profile(
+            user_key,
+            payday_mode=mode,
+            payday_day=payday_day,
+            payday_remind_enabled=remind_enabled,
+            payday_remind_time=remind_time,
+        )
+        month = parse_month(payload.get("month", ""))
+        return json_response({"saved": True, **await self._snapshot(user_key, month)})
+
+    async def api_payroll_pay(self):
+        payload = await request.json(default={})
+        user_key = str(payload.get("user") or "")
+        record = await self.store.get_user(user_key)
+        if record is None:
+            return error_response("找不到这个用户", status_code=404)
+        month = parse_month(
+            _salary_month([str(payload.get("salary_month") or "")]), f"{date.today():%Y-%m}"
+        )
+        if month > f"{date.today():%Y-%m}":
+            return error_response("不能给未来月份登记到账")
+        payroll = await self._payroll(user_key)
+        entry = next(
+            (item for item in payroll.get("entries", []) if item["salary_month"] == month),
+            None,
+        )
+        if entry is None:
+            return error_response("这个月还没有应发工资", status_code=404)
+        amount = entry["due"]
+        if "amount" in payload and payload.get("amount") not in {None, ""}:
+            try:
+                amount = float(payload["amount"])
+            except (TypeError, ValueError):
+                return error_response("到账金额格式不正确")
+        amount = round(max(0.0, min(float(entry["due"]), amount)), 2)
+        paid_on = _parse_day_token(str(payload.get("paid_on") or "")) or date.today()
+        if paid_on > date.today():
+            return error_response("到账日期不能是未来")
+        await self.store.save_payout(
+            user_key,
+            month,
+            amount=amount,
+            paid_on=paid_on.isoformat(),
+            note=str(payload.get("note") or "后台登记到账")[:200],
+        )
+        return json_response(
+            {
+                "saved": True,
+                "salary_month": month,
+                **await self._snapshot(
+                    user_key, parse_month(payload.get("month", ""))
+                ),
+            }
+        )
+
+    async def api_payroll_unpay(self):
+        payload = await request.json(default={})
+        user_key = str(payload.get("user") or "")
+        month = parse_month(
+            _salary_month([str(payload.get("salary_month") or "")]), f"{date.today():%Y-%m}"
+        )
+        await self.store.delete_payout(user_key, month)
+        return json_response(
+            {
+                "saved": True,
+                **await self._snapshot(
+                    user_key, parse_month(payload.get("month", ""))
+                ),
+            }
+        )
 
     async def api_mode(self):
         payload = await request.json(default={})

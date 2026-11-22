@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS profiles (
     overtime_rate        REAL NOT NULL DEFAULT 1.5,
     absence_deduction    INTEGER NOT NULL DEFAULT 0,
     rest_day_as_overtime INTEGER NOT NULL DEFAULT 1,
+    employment_stage     TEXT NOT NULL DEFAULT 'regular',
+    payday_mode          TEXT NOT NULL DEFAULT 'month_end',
+    payday_day           INTEGER NOT NULL DEFAULT 15,
+    payday_remind_enabled INTEGER NOT NULL DEFAULT 1,
+    payday_remind_time   TEXT NOT NULL DEFAULT '17:00',
     umo                  TEXT NOT NULL DEFAULT '',
     remind_enabled       INTEGER NOT NULL DEFAULT 1,
     remind_before_start  INTEGER NOT NULL DEFAULT 30,
@@ -117,6 +122,32 @@ CREATE TABLE IF NOT EXISTS deductions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_deductions_user_month ON deductions(user_key, month);
+
+CREATE TABLE IF NOT EXISTS salary_records (
+    user_key        TEXT NOT NULL,
+    month           TEXT NOT NULL,
+    pay_mode        TEXT NOT NULL DEFAULT 'hourly',
+    monthly_salary  REAL NOT NULL DEFAULT 0,
+    hourly_rate     REAL NOT NULL DEFAULT 0,
+    stage           TEXT NOT NULL DEFAULT 'regular',
+    note            TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (user_key, month)
+);
+
+CREATE INDEX IF NOT EXISTS idx_salary_user_month ON salary_records(user_key, month);
+
+CREATE TABLE IF NOT EXISTS salary_payouts (
+    user_key       TEXT NOT NULL,
+    salary_month   TEXT NOT NULL,
+    amount         REAL NOT NULL DEFAULT 0,
+    paid_on        TEXT NOT NULL DEFAULT '',
+    note           TEXT NOT NULL DEFAULT '',
+    updated_at     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (user_key, salary_month)
+);
+
+CREATE INDEX IF NOT EXISTS idx_payouts_user_month ON salary_payouts(user_key, salary_month);
 """
 
 # 老版本数据库补齐新增列（升级时不丢数据）
@@ -134,6 +165,11 @@ _PROFILE_EXTRA_COLUMNS = {
     "standard_hours": "REAL NOT NULL DEFAULT 8.0",
     "overtime_alert_enabled": "INTEGER NOT NULL DEFAULT 1",
     "rest_reminder_enabled": "INTEGER NOT NULL DEFAULT 1",
+    "employment_stage": "TEXT NOT NULL DEFAULT 'regular'",
+    "payday_mode": "TEXT NOT NULL DEFAULT 'month_end'",
+    "payday_day": "INTEGER NOT NULL DEFAULT 15",
+    "payday_remind_enabled": "INTEGER NOT NULL DEFAULT 1",
+    "payday_remind_time": "TEXT NOT NULL DEFAULT '17:00'",
 }
 
 _ALLOWED_FIELDS = {
@@ -160,6 +196,11 @@ _ALLOWED_FIELDS = {
     "standard_hours",
     "overtime_alert_enabled",
     "rest_reminder_enabled",
+    "employment_stage",
+    "payday_mode",
+    "payday_day",
+    "payday_remind_enabled",
+    "payday_remind_time",
 }
 
 
@@ -183,6 +224,10 @@ class UserRecord:
     standard_hours: float = 8.0
     overtime_alert_enabled: bool = True
     rest_reminder_enabled: bool = True
+    payday_mode: str = "month_end"
+    payday_day: int = 15
+    payday_remind_enabled: bool = True
+    payday_remind_time: str = "17:00"
 
     def to_dict(self) -> dict:
         return {
@@ -198,6 +243,7 @@ class UserRecord:
             "hourly_rate": self.profile.hourly_rate,
             "monthly_salary": self.profile.monthly_salary,
             "pay_mode": self.profile.pay_mode,
+            "employment_stage": self.profile.employment_stage,
             "overtime_rate": self.profile.overtime_rate,
             "absence_deduction": self.profile.absence_deduction,
             "rest_day_as_overtime": self.profile.rest_day_as_overtime,
@@ -213,6 +259,10 @@ class UserRecord:
             "standard_hours": self.standard_hours,
             "overtime_alert_enabled": self.overtime_alert_enabled,
             "rest_reminder_enabled": self.rest_reminder_enabled,
+            "payday_mode": self.payday_mode,
+            "payday_day": self.payday_day,
+            "payday_remind_enabled": self.payday_remind_enabled,
+            "payday_remind_time": self.payday_remind_time,
             "updated_at": self.updated_at,
         }
 
@@ -395,6 +445,29 @@ class ShiftStore:
             payload["standard_hours"] = max(
                 1.0, min(24.0, float(payload["standard_hours"] or 8.0))
             )
+        if "employment_stage" in payload:
+            stage = str(payload["employment_stage"] or "regular").lower()
+            payload["employment_stage"] = "intern" if stage == "intern" else "regular"
+        if "payday_mode" in payload:
+            mode = str(payload["payday_mode"] or "month_end").lower()
+            payload["payday_mode"] = (
+                "next_month" if mode in {"next_month", "next", "deferred"} else "month_end"
+            )
+        if "payday_day" in payload:
+            payload["payday_day"] = max(1, min(31, int(payload["payday_day"] or 15)))
+        if "payday_remind_enabled" in payload:
+            payload["payday_remind_enabled"] = int(bool(payload["payday_remind_enabled"]))
+        if "payday_remind_time" in payload:
+            payload["payday_remind_time"] = str(
+                payload["payday_remind_time"] or "17:00"
+            ).strip()[:5]
+        if "payday_mode" in payload:
+            mode = str(payload["payday_mode"] or "month_end").lower()
+            payload["payday_mode"] = (
+                "next_month" if mode in {"next_month", "deferred", "next"} else "month_end"
+            )
+        if "payday_day" in payload:
+            payload["payday_day"] = max(1, min(31, int(payload["payday_day"] or 15)))
 
         payload["updated_at"] = _now()
         assignments = ", ".join(f"{key} = ?" for key in payload)
@@ -423,6 +496,7 @@ class ShiftStore:
             standard_hours=float(row["standard_hours"] or 8.0),
             absence_deduction=bool(row["absence_deduction"]),
             rest_day_as_overtime=bool(row["rest_day_as_overtime"]),
+            employment_stage=row["employment_stage"] or "regular",
         )
         return UserRecord(
             user_key=row["user_key"],
@@ -443,7 +517,191 @@ class ShiftStore:
             standard_hours=float(row["standard_hours"] or 8.0),
             overtime_alert_enabled=bool(row["overtime_alert_enabled"]),
             rest_reminder_enabled=bool(row["rest_reminder_enabled"]),
+            payday_mode=row["payday_mode"] or "month_end",
+            payday_day=int(row["payday_day"] or 15),
+            payday_remind_enabled=bool(row["payday_remind_enabled"]),
+            payday_remind_time=row["payday_remind_time"] or "17:00",
         )
+
+    # ------------------------------------------------------------------ #
+    # 按月工资档案
+    # ------------------------------------------------------------------ #
+    async def get_salary_record(self, user_key: str, month: str) -> dict | None:
+        conn = await self._connect()
+        try:
+            cursor = await conn.execute(
+                "SELECT * FROM salary_records WHERE user_key = ? AND month = ?",
+                (user_key, month),
+            )
+            row = await cursor.fetchone()
+        finally:
+            await conn.close()
+        return dict(row) if row else None
+
+    async def list_salary_records(self, user_key: str, year: str = "") -> list[dict]:
+        conn = await self._connect()
+        try:
+            if year:
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM salary_records
+                    WHERE user_key = ? AND month LIKE ?
+                    ORDER BY month
+                    """,
+                    (user_key, f"{year}-%"),
+                )
+            else:
+                cursor = await conn.execute(
+                    "SELECT * FROM salary_records WHERE user_key = ? ORDER BY month",
+                    (user_key,),
+                )
+            rows = await cursor.fetchall()
+        finally:
+            await conn.close()
+        return [dict(row) for row in rows]
+
+    async def save_salary_record(
+        self,
+        user_key: str,
+        month: str,
+        *,
+        pay_mode: str = "hourly",
+        monthly_salary: float = 0.0,
+        hourly_rate: float = 0.0,
+        stage: str = "regular",
+        note: str = "",
+    ) -> dict:
+        mode = "monthly" if str(pay_mode or "").lower() == "monthly" else "hourly"
+        stage_value = "intern" if str(stage or "").lower() == "intern" else "regular"
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO salary_records
+                    (user_key, month, pay_mode, monthly_salary, hourly_rate, stage, note, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_key, month) DO UPDATE SET
+                    pay_mode = excluded.pay_mode,
+                    monthly_salary = excluded.monthly_salary,
+                    hourly_rate = excluded.hourly_rate,
+                    stage = excluded.stage,
+                    note = excluded.note,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user_key,
+                    month,
+                    mode,
+                    max(0.0, float(monthly_salary or 0.0)),
+                    max(0.0, float(hourly_rate or 0.0)),
+                    stage_value,
+                    str(note or "")[:200],
+                    _now(),
+                ),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+        return (await self.get_salary_record(user_key, month)) or {}
+
+    # ------------------------------------------------------------------ #
+    # 发薪到账登记
+    # ------------------------------------------------------------------ #
+    async def get_payout(self, user_key: str, salary_month: str) -> dict | None:
+        conn = await self._connect()
+        try:
+            cursor = await conn.execute(
+                "SELECT * FROM salary_payouts WHERE user_key = ? AND salary_month = ?",
+                (user_key, salary_month),
+            )
+            row = await cursor.fetchone()
+        finally:
+            await conn.close()
+        return dict(row) if row else None
+
+    async def list_payouts(self, user_key: str) -> list[dict]:
+        conn = await self._connect()
+        try:
+            cursor = await conn.execute(
+                "SELECT * FROM salary_payouts WHERE user_key = ? ORDER BY salary_month",
+                (user_key,),
+            )
+            rows = await cursor.fetchall()
+        finally:
+            await conn.close()
+        return [dict(row) for row in rows]
+
+    async def save_payout(
+        self,
+        user_key: str,
+        salary_month: str,
+        amount: float,
+        paid_on: str = "",
+        note: str = "",
+    ) -> dict:
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO salary_payouts
+                    (user_key, salary_month, amount, paid_on, note, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_key, salary_month) DO UPDATE SET
+                    amount = excluded.amount,
+                    paid_on = excluded.paid_on,
+                    note = excluded.note,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user_key,
+                    salary_month,
+                    round(max(0.0, float(amount or 0.0)), 2),
+                    str(paid_on or ""),
+                    str(note or "")[:200],
+                    _now(),
+                ),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+        return (await self.get_payout(user_key, salary_month)) or {}
+
+    async def delete_payout(self, user_key: str, salary_month: str) -> bool:
+        conn = await self._connect()
+        try:
+            cursor = await conn.execute(
+                "DELETE FROM salary_payouts WHERE user_key = ? AND salary_month = ?",
+                (user_key, salary_month),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            await conn.close()
+
+    async def list_active_months(self, user_key: str, year: str = "") -> list[str]:
+        """有班表或打卡的月份；年收入只遍历这些月份，避免凭空生成未来班表。"""
+        conn = await self._connect()
+        try:
+            params: tuple[str, ...] = (user_key, user_key)
+            schedule_filter = ""
+            punch_filter = ""
+            if year:
+                schedule_filter = " AND month LIKE ?"
+                punch_filter = " AND substr(day, 1, 7) LIKE ?"
+                params = (user_key, f"{year}-%", user_key, f"{year}-%")
+            cursor = await conn.execute(
+                f"""
+                SELECT month FROM schedules WHERE user_key = ?{schedule_filter}
+                UNION
+                SELECT substr(day, 1, 7) AS month FROM punches
+                WHERE user_key = ?{punch_filter}
+                """,
+                params,
+            )
+            rows = await cursor.fetchall()
+        finally:
+            await conn.close()
+        return sorted({str(row[0]) for row in rows if row[0]})
 
     # ------------------------------------------------------------------ #
     # 排班
@@ -1131,6 +1389,8 @@ _DUMP_TABLES = (
     "month_rests",
     "settings",
     "deductions",
+    "salary_records",
+    "salary_payouts",
 )
 
 _PUNCH_DEDUPE_COLUMNS = ("user_key", "day", "start", "end", "minutes")
