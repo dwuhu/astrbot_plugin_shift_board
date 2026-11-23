@@ -48,7 +48,7 @@ def help_text() -> str:
         "/排班 罚款 清除　　　　清空本月罚款\n"
         "/排班 时间 09:00 18:00 [休60]\n"
         "/排班 偏好 周末|均匀　　休息日是否贴近周末\n"
-        "/排班 图 [YYYY-MM]　　把月历渲染成图片\n"
+        "/排班 图 [YYYY-MM]　　月历图：天气、问候、今日进度灯带\n"
         "\n"
         "【打卡】\n"
         "/打卡 上班　　/打卡 下班　　/打卡 状态\n"
@@ -120,7 +120,7 @@ _HELP_GROUPS = [
             ("/排班 请假 恢复 <日期>", "恢复为正常工作日"),
             ("/排班 时间 09:00 18:00 60", "改班次和每班扣休"),
             ("/排班 罚款 200 迟到", "记罚款，从实发里扣"),
-            ("/排班 图 [YYYY-MM]", "把月历渲染成图片"),
+            ("/排班 图 [YYYY-MM]", "月历图：天气、问候、今日进度灯带"),
         ],
     ),
     (
@@ -193,7 +193,7 @@ _HELP_GROUPS = [
         "PAYDAY",
         "#22d3ee",
         [
-            ("/今日考勤", "今日工时、时薪、今天已获得多少钱"),
+            ("/今日考勤", "今日工时、天气问候、状态与今日已得"),
             ("/发薪 查看", "应发、已到账、未发合计"),
             ("/发薪 月底", "当月工资当月最后一天发"),
             ("/发薪 次月 15", "压一月，次月 15 号发"),
@@ -234,23 +234,24 @@ _HELP_HTML = """
 <html>
 <head><meta charset="utf-8" />
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;900&display=swap');
   * { box-sizing: border-box; }
   body {
     max-width: 960px; margin: 0 auto; padding: 26px 20px 30px;
-    font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
-    color: #e8eefc;
+    font-family: "Noto Sans SC", "Microsoft YaHei", "PingFang SC", sans-serif;
+    color: #f3f7ff; font-weight: 500; -webkit-font-smoothing: antialiased;
     background:
-      radial-gradient(circle at 8% 4%, rgba(56,189,248,.28), transparent 38%),
-      radial-gradient(circle at 92% 2%, rgba(244,114,182,.22), transparent 36%),
-      radial-gradient(circle at 72% 98%, rgba(250,204,21,.16), transparent 42%),
-      linear-gradient(160deg, #070b16 0%, #0c1324 52%, #111a2e 100%);
+      radial-gradient(circle at 8% 4%, rgba(56,189,248,.26), transparent 38%),
+      radial-gradient(circle at 92% 2%, rgba(244,114,182,.2), transparent 36%),
+      radial-gradient(circle at 72% 98%, rgba(250,204,21,.14), transparent 42%),
+      linear-gradient(160deg, #050a15 0%, #091120 52%, #0c1626 100%);
   }
   .shell {
     position: relative; overflow: hidden;
     border-radius: 28px; padding: 28px 30px 24px;
-    background: rgba(255,255,255,.065);
-    border: 1px solid rgba(255,255,255,.16);
-    box-shadow: 0 26px 70px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.24);
+    background: linear-gradient(145deg, rgba(16,28,45,.95), rgba(7,14,26,.97));
+    border: 1px solid rgba(170,205,255,.2);
+    box-shadow: 0 26px 70px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.12);
   }
   .shell::before {
     content: ""; position: absolute; inset: -40% -20% auto;
@@ -259,8 +260,8 @@ _HELP_HTML = """
   }
   header { position: relative; display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; }
   .kicker { font-size: 12px; letter-spacing: .3em; color: #7dd3fc; text-transform: uppercase; }
-  h1 { margin: 8px 0 6px; font-size: 38px; line-height: 1.1; letter-spacing: .04em; }
-  .sub { font-size: 14px; color: #a9b8d4; line-height: 1.6; max-width: 620px; }
+  h1 { margin: 8px 0 6px; font-size: 38px; font-weight: 900; line-height: 1.1; letter-spacing: .04em; color: #fff; }
+  .sub { font-size: 14px; color: #c0d0e4; line-height: 1.6; max-width: 620px; font-weight: 500; }
   .stamp {
     flex: none; padding: 12px 16px; border-radius: 16px; text-align: right;
     background: linear-gradient(135deg, rgba(56,189,248,.14), rgba(167,139,250,.18));
@@ -296,20 +297,20 @@ _HELP_HTML = """
     border-radius: 11px; font-size: 17px; background: rgba(255,255,255,.08);
     border: 1px solid rgba(255,255,255,.14);
   }
-  .title { font-size: 20px; font-weight: 700; letter-spacing: .02em; }
-  .tag { margin-left: auto; font-size: 10px; letter-spacing: .16em; color: var(--accent); opacity: .9; }
+  .title { font-size: 20px; font-weight: 800; letter-spacing: .02em; color: #ffffff; }
+  .tag { margin-left: auto; font-size: 10px; letter-spacing: .16em; color: var(--accent); opacity: 1; font-weight: 800; }
   .row {
     display: grid; grid-template-columns: 1.08fr 1fr; gap: 10px; align-items: center;
     padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,.07);
   }
   .row:last-child { border-bottom: 0; }
   .cmd {
-    justify-self: start; max-width: 100%; padding: 3px 7px; border-radius: 7px;
-    font-family: "Cascadia Mono", "Consolas", monospace; font-size: 12px;
-    color: #bfe8ff; background: rgba(56,189,248,.1);
-    border: 1px solid rgba(56,189,248,.18); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    justify-self: start; max-width: 100%; padding: 4px 8px; border-radius: 7px;
+    font-family: "Cascadia Mono", "Consolas", monospace; font-size: 13px;
+    font-weight: 600; color: #d6efff; background: rgba(56,189,248,.13);
+    border: 1px solid rgba(56,189,248,.24); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .desc { font-size: 12.5px; color: #a9b8d4; line-height: 1.35; }
+  .desc { font-size: 13px; color: #c4d3e6; line-height: 1.4; font-weight: 500; }
   .ai { grid-column: 1 / -1; }
   .chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 4px; }
   .chip {
@@ -776,61 +777,106 @@ _MONTH_HTML = """
 <html>
 <head><meta charset="utf-8" />
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;900&display=swap');
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 32px 36px;
-    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    margin: 0; padding: 30px 32px;
+    font-family: "Noto Sans SC", "Microsoft YaHei", "PingFang SC", sans-serif;
     background:
-      radial-gradient(circle at 12% 8%, rgba(125,211,252,.26), transparent 42%),
-      radial-gradient(circle at 88% 6%, rgba(240,171,252,.22), transparent 40%),
-      radial-gradient(circle at 70% 96%, rgba(250,204,21,.16), transparent 46%),
-      linear-gradient(160deg, #080d1a 0%, #0d1426 52%, #101a2e 100%);
-    color: #e8eefc;
+      radial-gradient(circle at 12% 8%, rgba(125,211,252,.24), transparent 42%),
+      radial-gradient(circle at 88% 6%, rgba(240,171,252,.2), transparent 40%),
+      radial-gradient(circle at 70% 96%, rgba(250,204,21,.14), transparent 46%),
+      linear-gradient(160deg, #050b16 0%, #091120 52%, #0b1526 100%);
+    color: #f3f7ff; font-weight: 500; -webkit-font-smoothing: antialiased;
   }
   .card {
-    background: rgba(255,255,255,.07);
-    border: 1px solid rgba(255,255,255,.16);
-    border-radius: 26px;
-    padding: 26px 28px 30px;
-    box-shadow: 0 22px 60px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.22);
+    background: linear-gradient(145deg, rgba(16,28,45,.94), rgba(7,14,26,.96));
+    border: 1px solid rgba(160,200,255,.2);
+    border-radius: 28px;
+    padding: 26px 28px 28px;
+    box-shadow: 0 24px 66px rgba(0,0,0,.52), inset 0 1px 0 rgba(255,255,255,.1);
     backdrop-filter: blur(18px);
   }
-  header { display: flex; justify-content: space-between; align-items: flex-end; }
-  .kicker { font-size: 13px; letter-spacing: .28em; color: #7dd3fc; }
-  h1 { margin: 6px 0 4px; font-size: 34px; letter-spacing: .02em; }
-  .who { font-size: 15px; color: #b7c4de; }
-  .mode {
-    padding: 8px 16px; border-radius: 999px; font-size: 15px;
-    background: linear-gradient(135deg, rgba(125,211,252,.22), rgba(240,171,252,.22));
-    border: 1px solid rgba(255,255,255,.24);
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; }
+  .kicker { font-size: 12px; letter-spacing: .26em; color: #7dd3fc; font-weight: 800; }
+  h1 { margin: 7px 0 5px; font-size: 34px; letter-spacing: .02em; font-weight: 900; color: #fff; }
+  .who { font-size: 14px; color: #b6c8de; font-weight: 500; }
+  .side { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+  .wx {
+    display: inline-flex; align-items: center; gap: 8px; padding: 7px 13px;
+    border-radius: 13px; border: 1px solid rgba(125,211,252,.36);
+    background: linear-gradient(135deg, rgba(56,189,248,.17), rgba(255,255,255,.05));
+    box-shadow: 0 8px 20px rgba(0,0,0,.2);
   }
-  .metrics { display: flex; gap: 12px; margin: 22px 0 20px; }
+  .wx .i { font-size: 22px; line-height: 1; }
+  .wx .t { font-size: 19px; font-weight: 900; color: #fff; line-height: 1; }
+  .wx .d { font-size: 11px; color: #d3e3f6; font-weight: 700; }
+  .mode {
+    padding: 8px 16px; border-radius: 999px; font-size: 14px; font-weight: 700;
+    color: #e7f2ff;
+    background: linear-gradient(135deg, rgba(125,211,252,.24), rgba(240,171,252,.2));
+    border: 1px solid rgba(255,255,255,.26);
+  }
+  .greet {
+    margin-top: 16px; padding: 12px 15px; border-radius: 14px;
+    display: flex; align-items: center; gap: 9px;
+    font-size: 13px; font-weight: 600; line-height: 1.55; color: #fff6d8;
+    background: linear-gradient(100deg, rgba(250,204,21,.13), rgba(52,211,153,.08));
+    border: 1px solid rgba(250,204,21,.24);
+  }
+  .greet b { font-size: 15px; color: #fde68a; }
+  .metrics { display: flex; gap: 12px; margin: 18px 0 18px; }
   .metric {
     flex: 1; padding: 14px 16px; border-radius: 16px;
-    background: rgba(255,255,255,.055);
-    border: 1px solid rgba(255,255,255,.12);
+    background: rgba(255,255,255,.06);
+    border: 1px solid rgba(170,205,255,.16);
   }
-  .metric span { display: block; font-size: 12px; color: #93a3c0; letter-spacing: .08em; }
-  .metric strong { font-size: 26px; font-weight: 700; }
-  .metric.money strong { color: #facc15; font-size: 22px; }
+  .metric span { display: block; font-size: 12px; color: #b9cae0; letter-spacing: .06em; font-weight: 700; }
+  .metric strong { font-size: 25px; font-weight: 900; color: #fff; }
+  .metric.money strong { color: #ffe066; font-size: 22px; }
   .grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 9px; }
-  .wd { text-align: center; font-size: 13px; color: #93a3c0; padding: 4px 0 2px; }
+  .wd { text-align: center; font-size: 13px; color: #a9bdd6; padding: 4px 0 2px; font-weight: 700; }
   .cell {
-    min-height: 74px; border-radius: 13px; padding: 8px 9px;
-    background: rgba(255,255,255,.05);
-    border: 1px solid rgba(255,255,255,.1);
+    position: relative; min-height: 78px; border-radius: 14px; padding: 9px 10px;
+    background: rgba(255,255,255,.055);
+    border: 1px solid rgba(180,210,255,.14);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
   }
-  .cell .num { font-size: 17px; font-weight: 700; }
-  .cell .tag { margin-top: 4px; font-size: 12px; color: #9fb0cc; }
-  .cell.work { background: rgba(56,189,248,.13); border-color: rgba(56,189,248,.34); }
-  .cell.rest { background: rgba(148,163,184,.07); border-color: rgba(148,163,184,.2); }
-  .cell.done { background: rgba(52,211,153,.16); border-color: rgba(52,211,153,.4); }
-  .cell.absent { background: rgba(248,113,113,.16); border-color: rgba(248,113,113,.4); }
-  .cell.leave { background: rgba(167,139,250,.14); border-color: rgba(167,139,250,.38); }
-  .cell.prejob { background: rgba(100,116,139,.1); border-color: rgba(148,163,184,.24); opacity:.86; }
-  .cell.today { box-shadow: 0 0 0 2px rgba(250,204,21,.8) inset; }
-  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-left: 4px; }
-  footer { margin-top: 22px; font-size: 13px; color: #8b9bb8; display: flex; justify-content: space-between; }
+  .cell .num { font-size: 18px; font-weight: 900; color: #fff; line-height: 1.2; }
+  .cell .tag { margin-top: 5px; font-size: 12px; font-weight: 600; color: #c6d5e8; line-height: 1.35; }
+  .cell.work { background: rgba(56,189,248,.17); border-color: rgba(56,189,248,.42); }
+  .cell.rest { background: rgba(148,163,184,.09); border-color: rgba(168,184,205,.24); }
+  .cell.rest .tag { color: #b9c7d9; }
+  .cell.done { background: rgba(52,211,153,.2); border-color: rgba(52,211,153,.48); }
+  .cell.done .tag { color: #c8f7df; }
+  .cell.absent { background: rgba(248,113,113,.2); border-color: rgba(248,113,113,.5); }
+  .cell.absent .tag { color: #ffd3d3; }
+  .cell.leave { background: rgba(167,139,250,.18); border-color: rgba(167,139,250,.46); }
+  .cell.leave .tag { color: #e0d6ff; }
+  .cell.prejob { background: rgba(59,130,246,.14); border-color: rgba(96,165,250,.34); }
+  .cell.prejob .tag { color: #cfe3ff; }
+  .cell.live {
+    background: linear-gradient(145deg, rgba(250,204,21,.34), rgba(250,204,21,.15));
+    border-color: rgba(10,18,30,.9);
+    box-shadow: inset 0 0 0 4px rgba(7,13,23,.72), inset 0 1px 0 rgba(255,255,255,.16);
+  }
+  .cell.today { box-shadow: inset 0 0 0 4px rgba(7,13,23,.78); }
+  .cell.live .tag { color: #fff4c2; font-weight: 700; }
+  .cell.today::after {
+    content: ""; position: absolute; inset: 0; border-radius: 14px; padding: 4px;
+    background: conic-gradient(#34d399 0%, #fbbf24 var(--p), rgba(255,255,255,.16) var(--p) 100%);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+  .cell.today.live::after {
+    background: conic-gradient(#fbbf24 0%, #fde68a var(--p), rgba(255,255,255,.24) var(--p) 100%);
+    filter: drop-shadow(0 0 8px rgba(250,204,21,.55));
+  }
+  .cell.today.done::after { filter: drop-shadow(0 0 8px rgba(52,211,153,.5)); }
+  footer { margin-top: 20px; font-size: 13px; color: #b2c3d8; display: flex; justify-content: space-between; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -841,8 +887,15 @@ _MONTH_HTML = """
         <h1>{{ month_label }}</h1>
         <div class="who">{{ nickname }} · {{ shift }} · 休 {{ break_minutes }} 分</div>
       </div>
-      <div class="mode">月休 {{ rest_mode }} 天</div>
-    </div>
+      <div class="side">
+        {% if weather_icon and weather_temp %}
+        <div class="wx"><span class="i">{{ weather_icon }}</span><span class="t">{{ weather_temp }}</span><span class="d">{{ weather_desc }}</span></div>
+        {% endif %}
+        <div class="mode">月休 {{ rest_mode }} 天</div>
+      </div>
+    </header>
+
+    {% if greeting %}<div class="greet"><b>👋</b><span>{{ greeting }}</span></div>{% endif %}
 
     <div class="metrics">
       <div class="metric"><span>实际工时</span><strong>{{ actual_hours }}h</strong></div>
@@ -855,7 +908,7 @@ _MONTH_HTML = """
       {% for wd in weekdays %}<div class="wd">{{ wd }}</div>{% endfor %}
       {% for blank in leading %}<div class="cell" style="opacity:.25"></div>{% endfor %}
       {% for day in days %}
-      <div class="cell {{ day.cls }}{% if day.today %} today{% endif %}">
+      <div class="cell {{ day.cls }}{% if day.today %} today{% endif %}"{% if day.today %} style="--p:{{ day.progress }}%"{% endif %}>
         <div class="num">{{ day.day }}</div>
         <div class="tag">{{ day.tag }}</div>
       </div>
@@ -878,12 +931,17 @@ def month_html(
     profile: Profile,
     day_stats: list[dict],
     summary: dict,
+    weather: dict | None = None,
+    greeting: str = "",
 ) -> str:
     first, last = month_bounds(month)
     leading = ["" for _ in range(first.weekday())]
     days = []
     for day in day_stats:
         status = day["status"]
+        working = bool(day.get("is_today")) and any(
+            (punch or {}).get("open") for punch in (day.get("punches") or [])
+        )
         if day["kind"] == "rest":
             cls = "rest overtime" if day["actual_minutes"] else "rest"
             tag = f"休息 · 加班{human_minutes(day['actual_minutes'])}" if day["actual_minutes"] else "休息"
@@ -893,6 +951,9 @@ def month_html(
         elif day["kind"] == "prejob":
             cls = "prejob"
             tag = "未上班"
+        elif working:
+            cls = "work live"
+            tag = f"{day['start']}-{day['end']} · 上班中"
         elif status == "done":
             cls = "work done"
             tag = f"{day['start']}-{day['end']} · {human_minutes(day['actual_minutes'])}"
@@ -902,15 +963,25 @@ def month_html(
         else:
             cls = "work"
             tag = f"{day['start']}-{day['end']} · {human_minutes(day['planned_minutes'])}"
+        is_today = day["day"] == date.today().isoformat()
+        planned = int(day.get("planned_minutes") or 0)
+        worked = int(day.get("actual_minutes") or 0) + int(day.get("live_minutes") or 0)
+        progress = (
+            min(100, max(0, round(worked * 100 / planned))) if planned > 0 else 0
+        )
+        if working and planned > 0:
+            tag = f"{day['start']}-{day['end']} · 上班中 {progress}%"
         days.append(
             {
                 "day": int(day["day"][-2:]),
                 "cls": cls,
                 "tag": tag,
-                "today": day["day"] == date.today().isoformat(),
+                "today": is_today,
+                "progress": progress,
             }
         )
 
+    weather = weather or {}
     return _render_template(
         {
             "month_label": month_label(month),
@@ -929,6 +1000,10 @@ def month_html(
             "hourly_rate": f"¥{profile.hourly_rate:g}",
             "overtime_rate": f"{profile.overtime_rate:g}",
             "projected_pay": f"¥{summary['projected_pay']:,.0f}",
+            "weather_icon": escape(str(weather.get("icon") or "")),
+            "weather_temp": escape(str(weather.get("temp") or "")),
+            "weather_desc": escape(str(weather.get("desc") or "")),
+            "greeting": escape(str(greeting or "")),
         }
     )
 
@@ -1007,6 +1082,17 @@ def attendance_html(data: dict) -> str:
     prev_label = escape(str(data.get("prev_label") or "上月"))
     today_status = escape(str(data.get("today_status") or "还没上班"))
     status_class = escape(str(data.get("status_class") or "idle"))
+    wx_icon = escape(str(data.get("weather_icon") or ""))
+    wx_temp = escape(str(data.get("weather_temp") or ""))
+    wx_desc = escape(str(data.get("weather_desc") or ""))
+    weather_html = ""
+    if wx_icon and wx_temp:
+        weather_html = (
+            f'<div class="wx"><span class="wx-i">{wx_icon}</span>'
+            f'<span class="wx-t">{wx_temp}</span>'
+            f'<span class="wx-d">{wx_desc}</span></div>'
+        )
+    greeting = escape(str(data.get("greeting") or ""))
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8" />
@@ -1014,36 +1100,48 @@ def attendance_html(data: dict) -> str:
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;900&display=swap');
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{width:760px;padding:26px;background:
-  radial-gradient(circle at 12% 0%, rgba(56,189,248,.32), transparent 36%),
-  radial-gradient(circle at 92% 12%, rgba(244,114,182,.26), transparent 34%),
-  linear-gradient(150deg,#07111f 0%,#0b1828 46%,#111827 100%);
-  font-family:'Noto Sans SC',-apple-system,'Microsoft YaHei',sans-serif;color:#e6f1ff}}
+  radial-gradient(circle at 12% 0%, rgba(56,189,248,.30), transparent 36%),
+  radial-gradient(circle at 92% 12%, rgba(244,114,182,.24), transparent 34%),
+  linear-gradient(150deg,#050d19 0%,#091522 46%,#0e1626 100%);
+  font-family:'Noto Sans SC',-apple-system,'Microsoft YaHei',sans-serif;
+  color:#f1f6ff;font-weight:500;-webkit-font-smoothing:antialiased}}
 .card{{position:relative;overflow:hidden;border-radius:30px;padding:28px;
-  background:linear-gradient(145deg,rgba(18,33,52,.88),rgba(10,20,34,.92));
-  border:1px solid rgba(148,199,255,.18);
-  box-shadow:0 24px 70px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.08)}}
+  background:linear-gradient(145deg,rgba(15,29,47,.94),rgba(7,14,26,.96));
+  border:1px solid rgba(148,199,255,.2);
+  box-shadow:0 24px 70px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.1)}}
 .orb{{position:absolute;border-radius:50%;filter:blur(2px);opacity:.5;pointer-events:none}}
 .orb.a{{width:190px;height:190px;right:-64px;top:-62px;background:radial-gradient(circle,#60a5fa,transparent 68%)}}
 .orb.b{{width:150px;height:150px;left:-58px;bottom:-58px;background:radial-gradient(circle,#f472b6,transparent 70%)}}
 .head{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;position:relative;z-index:1}}
 .kicker{{font-size:11px;letter-spacing:3px;color:#7dd3fc;font-weight:700}}
-h1{{font-size:30px;line-height:1.2;margin-top:6px;letter-spacing:.5px}}
-.name{{font-size:13px;color:#94a3b8;margin-top:7px}}
-.date{{text-align:right;color:#9fb4cc;font-size:12px;line-height:1.9}}
-.date b{{display:block;color:#f8fafc;font-size:20px;font-weight:800}}
+h1{{font-size:31px;line-height:1.2;margin-top:6px;letter-spacing:.5px;font-weight:900;color:#ffffff}}
+.name{{font-size:13px;color:#a9bcd5;margin-top:7px;font-weight:500}}
+.date{{text-align:right;color:#b3c5da;font-size:12px;line-height:1.9}}
+.date b{{display:block;color:#ffffff;font-size:20px;font-weight:800}}
+.wx{{display:inline-flex;align-items:center;gap:7px;margin-bottom:6px;padding:6px 12px;border-radius:12px;
+  background:linear-gradient(135deg,rgba(56,189,248,.16),rgba(255,255,255,.05));
+  border:1px solid rgba(125,211,252,.34);box-shadow:0 6px 18px rgba(0,0,0,.22)}}
+.wx .wx-i{{font-size:20px;line-height:1}}
+.wx .wx-t{{font-size:17px;font-weight:800;color:#ffffff;line-height:1}}
+.wx .wx-d{{font-size:11px;color:#cfe0f5;font-weight:700}}
 .status{{display:inline-flex;align-items:center;gap:6px;margin-top:7px;padding:6px 12px;border-radius:999px;
-  font-size:12px;font-weight:700;border:1px solid rgba(255,255,255,.1)}}
-.status.live{{background:rgba(34,197,94,.15);color:#86efac;border-color:rgba(34,197,94,.34)}}
-.status.done{{background:rgba(56,189,248,.12);color:#93c5fd}}
-.status.rest{{background:rgba(148,163,184,.12);color:#cbd5e1}}
-.status.idle{{background:rgba(250,204,21,.12);color:#fde68a}}
+  font-size:12px;font-weight:800;border:1px solid rgba(255,255,255,.12)}}
+.status.live{{background:rgba(250,204,21,.16);color:#ffe28a;border-color:rgba(250,204,21,.34)}}
+.status.done{{background:rgba(52,211,153,.16);color:#a7f3c4;border-color:rgba(52,211,153,.36)}}
+.status.rest{{background:rgba(148,163,184,.14);color:#e0e8f4}}
+.status.idle{{background:rgba(250,204,21,.16);color:#ffe28a;border-color:rgba(250,204,21,.3)}}
+.greet{{position:relative;z-index:1;margin-top:16px;padding:12px 15px;border-radius:14px;
+  display:flex;align-items:center;gap:9px;font-size:13px;font-weight:600;line-height:1.55;color:#fff7dc;
+  background:linear-gradient(100deg,rgba(250,204,21,.13),rgba(52,211,153,.08));
+  border:1px solid rgba(250,204,21,.24)}}
+.greet b{{font-size:15px;color:#fde68a}}
 .hero{{display:block;margin-top:20px;position:relative;z-index:1}}
 .glass{{border-radius:20px;padding:18px;background:rgba(255,255,255,.045);
   border:1px solid rgba(148,199,255,.14);backdrop-filter:blur(14px)}}
-.label{{font-size:11px;letter-spacing:1.5px;color:#8ba3bd;font-weight:700}}
+.label{{font-size:11px;letter-spacing:1.5px;color:#a9bdd6;font-weight:800}}
 .big{{font-size:42px;font-weight:900;line-height:1;margin-top:9px;
-  background:linear-gradient(120deg,#f8fafc,#93c5fd 55%,#c4b5fd);-webkit-background-clip:text;background-clip:text;color:transparent}}
-.sub{{font-size:12px;color:#9fb4cc;margin-top:9px;line-height:1.7}}
+  background:linear-gradient(120deg,#ffffff,#9ecbff 55%,#c9bcff);-webkit-background-clip:text;background-clip:text;color:transparent}}
+.sub{{font-size:12px;color:#b8c9dd;margin-top:9px;line-height:1.7;font-weight:500}}
 .earn{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:11px;
   padding:10px 13px;border-radius:13px;background:rgba(52,211,153,.085);
   border:1px solid rgba(52,211,153,.2)}}
@@ -1082,10 +1180,11 @@ h1{{font-size:30px;line-height:1.2;margin-top:6px;letter-spacing:.5px}}
       <h1>今日考勤</h1>
       <div class="name">{nickname} · 排班工坊</div>
     </div>
-    <div class="date"><b>{escape(str(data.get("date_label") or ""))}</b>{escape(str(data.get("now_label") or ""))}
+    <div class="date">{weather_html}<b>{escape(str(data.get("date_label") or ""))}</b>{escape(str(data.get("now_label") or ""))}
       <div class="status {status_class}">● {today_status}</div>
     </div>
   </div>
+  {f'<div class="greet"><b>👋</b><span>{greeting}</span></div>' if greeting else ''}
 
   <div class="hero">
     <div class="glass">

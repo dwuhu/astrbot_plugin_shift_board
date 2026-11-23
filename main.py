@@ -35,11 +35,13 @@ from .planner import (
     DaySlot,
     Profile,
     build_month_schedule_for,
+    covering_punch,
     format_hhmm,
     human_minutes,
     month_bounds,
     month_label,
     normalize_hhmm,
+    overlapping_punch,
     parse_hhmm,
     parse_month,
     shift_minutes,
@@ -57,6 +59,21 @@ _REST_MODES = (4, 6, 8)
 # 文转图清晰度：AstrBot 默认 quality=40 的 JPEG，缩到聊天窗口里字会糊。
 # 这里统一拉到 100，考勤图再按 760 视口用 1.8 倍设备像素输出。
 _T2I_OPTIONS = {"quality": 100, "type": "png"}
+# 排班图 / 帮助图默认输出约 1080P 宽，最高控制在 1.5K 以内。
+_T2I_HELP_OPTIONS = {
+    "quality": 100,
+    "type": "png",
+    "scale": "device",
+    "device_scale_factor_level": "high",
+    "viewport_width": 900,
+}
+_T2I_SCHEDULE_OPTIONS = {
+    "quality": 100,
+    "type": "png",
+    "scale": "device",
+    "device_scale_factor_level": "high",
+    "viewport_width": 840,
+}
 _T2I_ATTENDANCE_OPTIONS = {
     "quality": 100,
     "type": "png",
@@ -73,6 +90,147 @@ _PREFIX_RE = re.compile(r"^[\s/!#！。，,]+")
 def _now_hhmm() -> str:
     now = datetime.now()
     return format_hhmm(now.hour * 60 + now.minute)
+
+
+_WEATHER_ICONS = (
+    ("雷", "⛈"),
+    ("暴雨", "🌧"),
+    ("大雨", "🌧"),
+    ("雨", "🌦"),
+    ("雪", "🌨"),
+    ("雾", "🌫"),
+    ("霾", "🌫"),
+    ("阴", "☁"),
+    ("多云", "⛅"),
+    ("晴", "☀"),
+    ("风", "🌬"),
+)
+
+
+def _weather_icon(text: str) -> str:
+    for key, icon in _WEATHER_ICONS:
+        if key in str(text or ""):
+            return icon
+    return "🌡"
+
+
+def _weather_temp(text: str) -> str:
+    """从天气描述里抓温度，统一成 18° / -3° 这种短写法。"""
+    raw = str(text or "")
+    match = re.search(r"零下\s*(\d{1,2}(?:\.\d)?)", raw)
+    if match:
+        value = match.group(1)
+        if value.endswith(".0"):
+            value = value[:-2]
+        return f"-{value}°"
+    match = re.search(r"(-?\d{1,2}(?:\.\d)?)\s*(?:℃|°C|°|度)", raw)
+    if match:
+        value = match.group(1)
+        if value.endswith(".0"):
+            value = value[:-2]
+        return f"{value}°"
+    return ""
+
+
+def _weather_temp_number(text: str) -> float | None:
+    raw = str(text or "")
+    match = re.search(r"零下\s*(\d{1,2}(?:\.\d)?)", raw)
+    if match:
+        return -float(match.group(1))
+    match = re.search(r"(-?\d{1,2}(?:\.\d)?)\s*(?:℃|°C|°|度)", raw)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def _clothing_hint(line: str) -> str:
+    """温度偏低时，补一句人话提醒，卡片和微信提醒都能用。"""
+    temp = _weather_temp_number(line)
+    if temp is None or temp > 15:
+        return line
+    if any(word in line for word in ("加衣", "添衣", "外套", "穿厚", "多穿")):
+        return line
+    return line.rstrip("。 ") + "。天冷了，记得多加件衣服。"
+
+
+def _strip_region(text: str, city: str) -> str:
+    """卡片和提醒都不显示地区：即使模型把城市写进正文，也在这里擦掉。"""
+    raw = str(text or "")
+    variants = [str(city or "").strip()]
+    city = variants[0]
+    if city:
+        variants.extend(re.split(r"[市区县]", city))
+        if len(city) > 2:
+            variants.append(city[:2])
+    for item in sorted({v for v in variants if v}, key=len, reverse=True):
+        raw = raw.replace(item, "")
+    raw = re.sub(r"\s{2,}", " ", raw)
+    raw = re.sub(r"·\s*·", "·", raw)
+    return re.sub(r"^[\s·，,、]+|[\s·，,、]+$", "", raw)
+
+
+def _greeting_line(
+    now: datetime,
+    *,
+    kind: str = "",
+    open_start: str = "",
+    remaining_label: str = "",
+    shift_start: str = "",
+) -> str:
+    """按时间段和今天的上班状态，给一张有人情味的问候。"""
+    hour = now.hour
+    if kind == "rest":
+        if hour < 11:
+            return "早上好，今天休息，睡到自然醒也很幸福。"
+        if hour < 14:
+            return "中午好，今天休息，吃顿喜欢的午饭吧。"
+        if hour < 18:
+            return "下午好，今天休息，出去走走晒晒太阳？"
+        return "晚上好，今天休息，明天继续加油。"
+    if kind == "leave":
+        return "今天请假，安心休息，不用惦记工时。"
+    if open_start:
+        if hour < 11:
+            return "早上好，已经开始上班了，今天也要开开心心。"
+        if hour < 14:
+            return "中午好，吃饭了吗？再忙也要好好吃饭。"
+        if hour < 18:
+            if remaining_label and remaining_label not in {"—", "已过下班点"}:
+                return f"下午好，还有 {remaining_label} 下班，晚上准备去哪儿玩？"
+            return "下午好，忙完这一段就快收工啦。"
+        return "晚上好，今天辛苦了，回家好好放松。"
+    if hour < 11:
+        if shift_start:
+            return f"早上好，今天 {shift_start} 上班，吃个早饭再出发。"
+        return "早上好，新的一天，慢慢来就好。"
+    if hour < 14:
+        return "中午好，吃饭了吗？下午再慢慢忙。"
+    if hour < 18:
+        return "下午好，今天还没打卡，别忘了上班卡。"
+    if hour < 23:
+        return "晚上好，今天还没打卡，记得补一下工时。"
+    return "夜深了，早点睡，明天才有力气。"
+
+
+def _summary_greeting(summary: dict) -> str:
+    today_day = next(
+        (day for day in summary.get("days", []) if getattr(day, "is_today", False)),
+        None,
+    )
+    remaining = int(summary.get("today_remaining_minutes") or 0)
+    if remaining > 0:
+        remaining_label = human_minutes(remaining)
+    elif summary.get("today_open_start"):
+        remaining_label = "已过下班点"
+    else:
+        remaining_label = "—"
+    return _greeting_line(
+        datetime.now(),
+        kind=(today_day.kind if today_day is not None else ""),
+        open_start=summary.get("today_open_start") or "",
+        remaining_label=remaining_label,
+        shift_start=(today_day.start if today_day is not None else ""),
+    )
 
 
 def _parse_day_token(token: str) -> date | None:
@@ -923,7 +1081,9 @@ class ShiftBoardPlugin(Star):
             "calendar": calendar,
         }
 
-    async def _attendance_data(self, user: UserRecord) -> dict:
+    async def _attendance_data(
+        self, user: UserRecord, weather: dict | None = None
+    ) -> dict:
         """今日考勤卡片的数据：今天工时、今日按时薪累计收入、本月/上月工资。"""
         today = date.today()
         month = f"{today:%Y-%m}"
@@ -996,15 +1156,32 @@ class ShiftBoardPlugin(Star):
             0,
             int(summary.get("planned_minutes") or 0)
             - int(summary.get("actual_minutes") or 0)
-            - int(summary.get("today_open_minutes") or 0),
+            - sum(
+                int(day.live_minutes or 0)
+                for day in summary.get("days", [])
+                if day.is_today
+            ),
         )
         # 今天这笔按小时实时累计：上了几小时，就加几小时的时薪。
         hourly_rate = round(max(0.0, float(summary.get("hourly_rate") or 0)), 2)
         today_hours = round(today_minutes / 60, 2)
         today_earned = round(today_hours * hourly_rate, 2)
         prev_paid = round(max(0.0, float(previous.get("paid", 0) or 0)), 2)
+        greeting = _greeting_line(
+            datetime.now(),
+            kind=(today_stat.kind if today_stat is not None else ""),
+            open_start=(open_start or ""),
+            remaining_label=remaining_label,
+            shift_start=(today_stat.start if today_stat is not None else ""),
+        )
+        weather = weather or {}
         return {
             "nickname": user.nickname,
+            "greeting": greeting,
+            "weather_icon": weather.get("icon", ""),
+            "weather_temp": weather.get("temp", ""),
+            "weather_desc": weather.get("desc", ""),
+            "weather_text": weather.get("line", ""),
             "date_label": f"{today.month}月{today.day}日",
             "now_label": f"现在 {summary.get('now_label', _now_hhmm())}",
             "today_status": status_label,
@@ -1422,8 +1599,10 @@ class ShiftBoardPlugin(Star):
             f"城市：{city}\n日期：{date_text}\n时段：{when}\n"
             f"班次：{slot.start}-{slot.end}\n\n"
             f"联网搜索结果：\n{results[:3000]}\n\n"
-            "请只根据上面的搜索结果，写一句 20~50 字的中文天气提醒。"
-            "包含天气现象、气温、是否需要带伞或添衣；不要链接、不要来源、不要 Markdown。"
+            "请只根据上面的搜索结果，输出三段，用竖线分隔："
+            "天气现象|当前气温|一句穿衣或带伞提醒。"
+            "例如：多云|18℃|早晚偏凉，带件薄外套。"
+            "不要城市、日期、链接、来源、Markdown。"
             "如果结果不足以判断天气，只输出：天气信息暂时没查到。"
         )
         response = await asyncio.wait_for(
@@ -1432,7 +1611,7 @@ class ShiftBoardPlugin(Star):
                 prompt=prompt,
                 system_prompt=(
                     "你是天气播报员。严格依据联网搜索结果，不补充常识、不编造温度；"
-                    "输出一行中文，不要解释。"
+                    "只输出「现象|气温|提醒」三段，不要解释。"
                 ),
             ),
             timeout=30,
@@ -1441,9 +1620,49 @@ class ShiftBoardPlugin(Star):
         text = text.strip("`*# \"'“”")
         if not text or "没查到" in text or "无法" in text or "抱歉" in text:
             return ""
+        parts = [item.strip() for item in text.split("|")]
+        if len(parts) >= 3:
+            condition, temp_text, tip = parts[0], parts[1], parts[2]
+            icon = _weather_icon(condition)
+            temp = _weather_temp(temp_text) or _weather_temp(text)
+            tip = tip.strip("。；; ")
+            if len(tip) > 60:
+                tip = tip[:60].rstrip("，。；,; ") + "。"
+            head = f"{icon} {temp}".strip()
+            middle = condition.strip("。；; ")
+            line = f"{head} · {middle}，{tip}。" if tip else f"{head} · {middle}。"
+            return _clothing_hint(_strip_region(line, city))
         if len(text) > 90:
             text = text[:90].rstrip("，。；,; ") + "。"
-        return f"🌦 {city} · {text}"
+        return _clothing_hint(
+            _strip_region(f"{_weather_icon(text)} {_weather_temp(text)} · {text}".strip(), city)
+        )
+
+    async def _weather_brief(self, user: UserRecord) -> dict:
+        """给考勤图 / 排班图用的短天气：只留图标、温度和天气现象，不带地区。"""
+        today = date.today()
+        slot = await self._slot_for_day(user.user_key, today, user.profile)
+        if slot is None:
+            slot = DaySlot(
+                day=today.isoformat(),
+                kind="work",
+                start=user.profile.shift_start,
+                end=user.profile.shift_end,
+                planned_minutes=user.profile.daily_minutes,
+            )
+        line = await self._weather_line(user, "in", today, slot)
+        if not line:
+            return {}
+        head, _, rest = line.partition("·")
+        temp = _weather_temp(line)
+        icon = head.strip().split(" ")[0] if head.strip() else _weather_icon(rest)
+        desc = rest.strip().split("，")[0].strip("。 ")
+        return {
+            "icon": icon or "🌡",
+            "temp": temp,
+            "desc": desc,
+            "line": line,
+        }
 
     async def _search_weather(
         self, user: UserRecord, city: str, kind: str, day: date
@@ -1518,7 +1737,7 @@ class ShiftBoardPlugin(Star):
                 render.help_html(),
                 {},
                 return_url=True,
-                options=_T2I_OPTIONS,
+                options=_T2I_HELP_OPTIONS,
                 umo=event.unified_msg_origin,
             )
         except Exception as exc:  # noqa: BLE001 - t2i 服务未开时回退文本
@@ -1877,15 +2096,30 @@ class ShiftBoardPlugin(Star):
         _, summary = await self._month_stats(user.user_key, month, user.profile)
         month_profile = _profile_from_summary(user.profile, summary)
         day_dicts = [_day_dict(d) for d in summary["days"]]
-        html = render.month_html(month, user.nickname, month_profile, day_dicts, summary)
+        html = render.month_html(
+            month,
+            user.nickname,
+            month_profile,
+            day_dicts,
+            summary,
+            weather=await self._weather_brief(user),
+            greeting=_summary_greeting(summary),
+        )
         try:
             url = await self.html_render(
-                html, {}, return_url=True, options=_T2I_OPTIONS, umo=event.unified_msg_origin
+                html,
+                {},
+                return_url=True,
+                options=_T2I_SCHEDULE_OPTIONS,
+                umo=event.unified_msg_origin,
             )
         except Exception as exc:  # noqa: BLE001 - t2i 服务未开时回退文本
             logger.warning("排班月历渲染图片失败，回退文本：%s", exc)
             yield event.plain_result(
-                render.month_text(month, user.nickname, month_profile, day_dicts, summary)
+                f"{_summary_greeting(summary)}\n"
+                + render.month_text(
+                    month, user.nickname, month_profile, day_dicts, summary
+                )
             )
             return
         yield event.image_result(url)
@@ -1894,7 +2128,9 @@ class ShiftBoardPlugin(Star):
     async def today_attendance(self, event: AstrMessageEvent):
         """单独发一张今日考勤图：今天上了多久、本月/上月应发、未发合计。"""
         user = await self._user(event)
-        data = await self._attendance_data(user)
+        data = await self._attendance_data(
+            user, await self._weather_brief(user)
+        )
         try:
             url = await self.html_render(
                 render.attendance_html(data),
@@ -1906,7 +2142,13 @@ class ShiftBoardPlugin(Star):
         except Exception as exc:  # noqa: BLE001 - t2i 服务未开时回退文本
             logger.warning("今日考勤图片渲染失败，回退文本：%s", exc)
             yield event.plain_result(
-                f"📋 今日考勤 · {user.nickname}\n"
+                (f"{data['greeting']}\n" if data.get("greeting") else "")
+                + (
+                    f"{data['weather_text']}\n"
+                    if data.get("weather_text")
+                    else ""
+                )
+                + f"📋 今日考勤 · {user.nickname}\n"
                 f"今天已上 {data['today_minutes_label']}，距下班 {data['today_remaining_label']}\n"
                 f"今天已获得 {data['today_earned']}（{data['today_hourly']} × {data['today_hours_value']}）\n"
                 f"{data['month_label']}应发 {data['month_due']}，未发 {data['month_unpaid']}\n"
@@ -2062,6 +2304,14 @@ class ShiftBoardPlugin(Star):
                 f"你 {opened.start} 已经打过上班卡了，还在计时中。\n下班后发「/打卡 下班」即可。"
             )
             return
+        covered = covering_punch(punches)
+        if covered:
+            yield event.plain_result(
+                f"今天已有一条 {covered.start}-{covered.end} 的补录，时间盖住了现在，"
+                "再打卡会重复算工时。\n"
+                f"先发「/打卡 删 {today:%m-%d}」删掉当天记录，再重新「/打卡 上班」。"
+            )
+            return
         punch = await self.store.open_punch(user.user_key, today.isoformat(), _now_hhmm())
         yield event.plain_result(
             render.punch_result_text(
@@ -2106,16 +2356,11 @@ class ShiftBoardPlugin(Star):
                 user.nickname,
             )
         )
-        today_punches = await self.store.list_punches(
-            user.user_key, open_day.isoformat(), open_day.isoformat()
-        )
-        closed_minutes_total = sum(
-            max(0, int(punch.minutes or 0)) for punch in today_punches if not punch.is_open
-        )
         pay, summary = await self._day_earnings(user, open_day)
+        today_total = int(summary.get("today_minutes", 0) or 0)
         if pay > 0:
             money_line = (
-                f"今天入账 ¥{pay:,.2f}（实记 {human_minutes(closed_minutes_total)}"
+                f"今天入账 ¥{pay:,.2f}（实记 {human_minutes(today_total)}"
                 f"，含本段 {human_minutes(closed.minutes)}）\n"
                 f"本月累计实发 ¥{summary['total_pay']:,.2f}"
                 f" · 全月预计 ¥{summary['projected_pay']:,.2f}"
@@ -2140,13 +2385,9 @@ class ShiftBoardPlugin(Star):
         )
         opened = next((p for p in punches if p.is_open), None)
         open_info = None
-        closed_minutes_total = sum(
-            max(0, int(p.minutes or 0)) for p in punches if not p.is_open
-        )
-        today_minutes = closed_minutes_total
+        today_minutes = int(summary.get("today_minutes", 0) or 0)
         if opened:
             open_minutes = shift_minutes(opened.start, _now_hhmm(), 0)
-            today_minutes += open_minutes
             open_info = {
                 "start": opened.start,
                 "elapsed_minutes": open_minutes,
@@ -2195,6 +2436,22 @@ class ShiftBoardPlugin(Star):
 
         start = normalize_hhmm(start_token, "09:00")
         end = normalize_hhmm(end_token, "18:00")
+        if day == date.today() and end > _now_hhmm():
+            yield event.plain_result(
+                f"今天还没到 {end}，不能补一段未来的下班时间。\n"
+                f"今天最多补到 {_now_hhmm()}；正常上班请用「/打卡 上班」，到点再「/打卡 下班」。"
+            )
+            return
+        existing = await self.store.list_punches(
+            user.user_key, day.isoformat(), day.isoformat()
+        )
+        overlap = overlapping_punch(day.isoformat(), start, end, existing)
+        if overlap:
+            yield event.plain_result(
+                f"这段时间和已有打卡 {overlap.start}-{overlap.end} 重叠，没有写入。\n"
+                f"先「/打卡 删 {day:%m-%d}」清掉当天记录，再重新补。"
+            )
+            return
         slot = await self._slot_for_day(user.user_key, day, user.profile)
         deduct = user.profile.break_minutes if (slot and slot.is_work) else 0
         minutes = shift_minutes(start, end, deduct)
@@ -2998,6 +3255,7 @@ class ShiftBoardPlugin(Star):
     async def ai_schedule_image(self, event: AstrMessageEvent, month: str = "") -> str:
         """生成并单独发送当前说话人的整月排班表图片（排班月历）。
 
+        图上带天气图标与温度（不显示地区）、时段问候；今天这一格黄色高亮，边框按当天进度走灯带。
         用户说「排班图」「把排班表发成图片」「看看这个月怎么排」「下个月排班图」时调用本工具。
         只问文字版班表、休息日、班次、工时或工资时，用 shift_get_schedule。
 
@@ -3010,14 +3268,20 @@ class ShiftBoardPlugin(Star):
         month_profile = _profile_from_summary(user.profile, summary)
         day_dicts = [_day_dict(d) for d in summary["days"]]
         html = render.month_html(
-            target, user.nickname, month_profile, day_dicts, summary
+            target,
+            user.nickname,
+            month_profile,
+            day_dicts,
+            summary,
+            weather=await self._weather_brief(user),
+            greeting=_summary_greeting(summary),
         )
         try:
             url = await self.html_render(
                 html,
                 {},
                 return_url=True,
-                options=_T2I_OPTIONS,
+                options=_T2I_SCHEDULE_OPTIONS,
                 umo=event.unified_msg_origin,
             )
         except Exception as exc:  # noqa: BLE001 - t2i 服务未开时回退文本
@@ -3068,7 +3332,9 @@ class ShiftBoardPlugin(Star):
     async def ai_today_attendance(self, event: AstrMessageEvent) -> str:
         """生成并发送一张「今日考勤」图片给当前说话人：今天上了多久、按小时累计今天已获得多少钱、距下班还剩多久、本月和上月应发与未发、未发合计。用户说「今日考勤」时调用。"""
         user = await self._user(event)
-        data = await self._attendance_data(user)
+        data = await self._attendance_data(
+            user, await self._weather_brief(user)
+        )
         try:
             url = await self.html_render(
                 render.attendance_html(data),
@@ -3570,6 +3836,12 @@ class ShiftBoardPlugin(Star):
             opened = next((p for p in punches if p.is_open), None)
             if opened:
                 return f"{user.nickname} {opened.start} 已经在计时，不用重复打卡。"
+            covered = covering_punch(punches)
+            if covered:
+                return (
+                    f"今天已有 {covered.start}-{covered.end} 的补录盖住了现在，"
+                    "再打卡会重复算工时；先删除当天记录再打卡。"
+                )
             punch = await self.store.open_punch(
                 user.user_key, today.isoformat(), _now_hhmm()
             )
@@ -3690,8 +3962,12 @@ class ShiftBoardPlugin(Star):
                 current += timedelta(days=1)
                 continue
             iso = current.isoformat()
+            if current == today and finish_time > _now_hhmm():
+                future += 1
+                current += timedelta(days=1)
+                continue
             existing = await self.store.list_punches(user.user_key, iso, iso)
-            if any(p.start == begin_time and (p.end or "") == finish_time for p in existing):
+            if overlapping_punch(iso, begin_time, finish_time, existing):
                 duplicated += 1
                 current += timedelta(days=1)
                 continue
@@ -4312,6 +4588,18 @@ class ShiftBoardPlugin(Star):
             return error_response("不能给未来日期补打卡")
         start = normalize_hhmm(payload.get("start"), "09:00")
         end = normalize_hhmm(payload.get("end"), "18:00")
+        if day == date.today() and end > _now_hhmm():
+            return error_response(
+                f"今天还没到 {end}，不能补未来的下班时间；今天最多补到 {_now_hhmm()}"
+            )
+        existing = await self.store.list_punches(
+            user_key, day.isoformat(), day.isoformat()
+        )
+        overlap = overlapping_punch(day.isoformat(), start, end, existing)
+        if overlap:
+            return error_response(
+                f"与已有打卡 {overlap.start}-{overlap.end} 重叠，先删掉当天记录再补"
+            )
         slot = await self._slot_for_day(user_key, day, record.profile)
         deduct = record.profile.break_minutes if (slot and slot.is_work) else 0
         minutes = shift_minutes(start, end, deduct)

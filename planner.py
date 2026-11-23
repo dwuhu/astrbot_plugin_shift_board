@@ -375,6 +375,139 @@ def _open_punch_minutes(punch: Punch, now: datetime) -> int:
     return max(0, min(24 * 60, int((now - started).total_seconds() // 60)))
 
 
+def _raw_punch_interval(
+    punch: Punch, now: datetime | None = None
+) -> tuple[datetime, datetime] | None:
+    """打卡的原始时间区间，不做「未来只算到现在」的截断。"""
+    now = now or datetime.now()
+    try:
+        start = datetime.fromisoformat(f"{punch.day}T{punch.start}")
+    except ValueError:
+        return None
+    if punch.is_open:
+        end = now
+        if start > end:
+            start -= timedelta(days=1)
+        return start, end
+    if not punch.end:
+        return None
+    try:
+        end = datetime.fromisoformat(f"{punch.day}T{punch.end}")
+    except ValueError:
+        return None
+    if end <= start:
+        end += timedelta(days=1)
+    return start, end
+
+
+def punch_interval(
+    punch: Punch, now: datetime | None = None
+) -> tuple[datetime, datetime, int, int] | None:
+    """把一条打卡变成时间区间，并返回（开始, 结束, 有效分钟, 被扣除分钟）。
+
+    今天已经结束但结束时间还在未来的记录只算到当前时间，避免一条
+    「08:00-20:00 整段补录」在早上就把 12 小时全算进今天。
+    """
+    now = now or datetime.now()
+    try:
+        start = datetime.fromisoformat(f"{punch.day}T{punch.start}")
+    except ValueError:
+        return None
+    if punch.is_open:
+        end = now
+        if start > end:
+            start -= timedelta(days=1)
+        raw = max(0, int((end - start).total_seconds() // 60))
+        live = max(0, min(24 * 60, raw))
+        return start, end, live, max(0, raw - live)
+    if not punch.end:
+        return None
+    try:
+        end = datetime.fromisoformat(f"{punch.day}T{punch.end}")
+    except ValueError:
+        return None
+    if end <= start:
+        end += timedelta(days=1)
+    if end > now:
+        end = now
+        raw = max(0, int((end - start).total_seconds() // 60))
+        return (start, end, raw, 0) if raw > 0 else None
+    raw = max(0, int((end - start).total_seconds() // 60))
+    if raw <= 0:
+        return None
+    stored = max(0, int(punch.minutes or 0))
+    return start, end, min(raw, stored), max(0, raw - stored)
+
+
+def overlapping_punch(
+    day: str,
+    start: str,
+    end: str,
+    punches: list[Punch],
+    now: datetime | None = None,
+) -> Punch | None:
+    """找一条与指定时间区间重叠的已有打卡，用来拒绝重复补录。"""
+    now = now or datetime.now()
+    try:
+        new_start = datetime.fromisoformat(f"{day}T{start}")
+        new_end = datetime.fromisoformat(f"{day}T{end}")
+    except ValueError:
+        return None
+    if new_end <= new_start:
+        new_end += timedelta(days=1)
+    for punch in punches:
+        span = _raw_punch_interval(punch, now)
+        if span is None:
+            continue
+        old_start, old_end = span
+        if new_start < old_end and old_start < new_end:
+            return punch
+    return None
+
+
+def covering_punch(
+    punches: list[Punch], now: datetime | None = None
+) -> Punch | None:
+    """找一条已经结束、但时间区间仍然盖住「现在」的打卡。"""
+    now = now or datetime.now()
+    for punch in punches:
+        if punch.is_open:
+            continue
+        span = _raw_punch_interval(punch, now)
+        if span is None:
+            continue
+        start, end = span
+        if start <= now < end:
+            return punch
+    return None
+
+
+def _union_minutes(intervals: list[tuple[datetime, datetime, int, int]]) -> int:
+    """把同一天重叠的打卡按时间区间去重，重叠部分只算一次。"""
+    if not intervals:
+        return 0
+    ordered = sorted(intervals, key=lambda item: item[0])
+    total = 0
+
+    def flush(start: datetime, end: datetime, deducted: int) -> None:
+        nonlocal total
+        raw = max(0, int((end - start).total_seconds() // 60))
+        if raw < 240:
+            deducted = 0
+        total += max(0, raw - max(0, deducted))
+
+    group_start, group_end, _, group_deducted = ordered[0]
+    for start, end, _, deducted in ordered[1:]:
+        if start <= group_end:
+            group_end = max(group_end, end)
+            group_deducted = max(group_deducted, deducted)
+            continue
+        flush(group_start, group_end, group_deducted)
+        group_start, group_end, group_deducted = start, end, deducted
+    flush(group_start, group_end, group_deducted)
+    return total
+
+
 def _shift_window(day: str, start: str, end: str) -> tuple[datetime, datetime] | None:
     """返回某天班次的开始 / 结束时间；夜班结束自动进到次日。"""
     try:
@@ -489,8 +622,16 @@ def summarize(
         is_today = current == today
         is_future = current > today
         day_punches = grouped.get(slot.day, [])
-        actual = sum(max(0, int(p.minutes or 0)) for p in day_punches if not p.is_open)
-        live = sum(_open_punch_minutes(p, now) for p in day_punches if p.is_open)
+        pairs = [
+            (punch, punch_interval(punch, now)) for punch in day_punches
+        ]
+        spans = [span for _, span in pairs if span is not None]
+        closed_spans = [
+            span for punch, span in pairs if span is not None and not punch.is_open
+        ]
+        # 同一天多条打卡重叠时只算一次，避免「整段补录 + 实时上班」重复计时。
+        actual = _union_minutes(closed_spans)
+        live = max(0, _union_minutes(spans) - actual)
         # 未上班 / 请假仍然保留原班次信息，方便展示和恢复；只是不计入有效工作日
         effective_kind = slot.kind
         if effective_kind == "work" and first_punch_day and slot.day < first_punch_day:
@@ -571,12 +712,20 @@ def summarize(
     today_open_start = next(
         (p.start for s in today_stats for p in s.punches if p.is_open), ""
     )
-    today_open_minutes = sum(s.live_minutes for s in today_stats)
+    today_open_minutes = sum(
+        max(0, _open_punch_minutes(p, now))
+        for s in today_stats
+        for p in s.punches
+        if p.is_open
+    )
     # 上班过程中还剩多久下班：按当前查看/正在计时的那个工作日班次结束时间算；
     # 夜班结束时间在次日，跨午夜时也能继续倒计时。
     today_remaining_minutes = 0
     today_end_label = ""
-    open_punch = next((p for p in punches if p.is_open), None)
+    open_punches = [p for p in punches if p.is_open]
+    open_punch = (
+        max(open_punches, key=lambda p: (p.day, p.start)) if open_punches else None
+    )
     active_shift = next((s for s in today_stats if s.kind == "work"), None)
     if open_punch:
         active_shift = next(
